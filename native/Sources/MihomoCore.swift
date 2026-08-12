@@ -19,7 +19,10 @@ final class MihomoCore: @unchecked Sendable {
     private let controllerSession: URLSession
 
     init(protocolClasses: [AnyClass]? = nil, executableOverride: URL? = nil) {
-        let base = 20_000 + (Int(ProcessInfo.processInfo.processIdentifier) % 10_000) * 2
+        // Use a stable local range rather than a PID-derived port.  This avoids
+        // leaving macOS system proxy aimed at an unreachable port across a
+        // normal application restart, and keeps diagnostics predictable.
+        let base = 20_000
         socksPort = base
         controllerPort = base + 1
         mixedPort = base + 2

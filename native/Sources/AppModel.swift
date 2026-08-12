@@ -77,6 +77,10 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.server.stop(); self?.core.stopAndWait(); if self?.systemProxy == true { self?.setSystemProxy(false) } }
         }
         if config.mode != .direct, !config.subscriptions.isEmpty {
+            // Start from the saved provider first.  Waiting for an online refresh
+            // here can deadlock startup when macOS still points at a former local
+            // proxy port; start() immediately rebinds system proxy to this core.
+            if config.proxyEnabled { start() }
             Task { [weak self] in
                 guard let self else { return }
                 for subscription in self.config.subscriptions { await self.refreshSubscription(subscription.id) }
@@ -112,6 +116,7 @@ final class AppModel: ObservableObject {
             running = true
             config.proxyEnabled = true
             save()
+            if systemProxy { refreshSystemProxyEndpoint() }
             return
         }
         let requestedPort = config.proxyPort
@@ -119,6 +124,7 @@ final class AppModel: ObservableObject {
             do {
                 try server.start(port: port)
                 config.proxyPort = port; running = true; config.proxyEnabled = true; save()
+                if systemProxy { refreshSystemProxyEndpoint() }
                 if port != requestedPort { notice = "端口 \(requestedPort) 被占用，已自动切换到 \(port)" }
                 return
             } catch { continue }
@@ -231,19 +237,19 @@ final class AppModel: ObservableObject {
         guard !services.isEmpty else { notice = "没有找到可配置的网络服务"; return }
         var failures: [String] = []
         if enabled {
-            config.systemProxyBackups = services.compactMap { service in
-                guard let web = Self.proxyEndpoint(service: service, secure: false),
-                      let secure = Self.proxyEndpoint(service: service, secure: true) else {
-                    failures.append(service)
-                    return nil
+            // Preserve the original macOS proxy exactly once.  Reapplying after
+            // a core restart must not overwrite it with Zhilian's old port.
+            if !systemProxy {
+                config.systemProxyBackups = services.compactMap { service in
+                    guard let web = Self.proxyEndpoint(service: service, secure: false),
+                          let secure = Self.proxyEndpoint(service: service, secure: true) else {
+                        failures.append(service)
+                        return nil
+                    }
+                    return .init(service: service, web: web, secureWeb: secure)
                 }
-                return .init(service: service, web: web, secureWeb: secure)
             }
-            for service in services {
-                let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
-                let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
-                if !web.success || !secure.success { failures.append(service) }
-            }
+            failures.append(contentsOf: applySystemProxy(services: services))
         } else {
             let backups = Dictionary(uniqueKeysWithValues: config.systemProxyBackups.map { ($0.service, $0) })
             for service in services {
@@ -281,8 +287,28 @@ final class AppModel: ObservableObject {
             }
             do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: mode, forceReload: true) }
             catch { notice = "切换模式失败：\(error.localizedDescription)"; return }
-            if systemProxy { setSystemProxy(true) }
+            if systemProxy { refreshSystemProxyEndpoint() }
         }
+    }
+
+    /// Rebind an already-enabled macOS proxy after mihomo receives a new
+    /// per-process mixed-port.  This avoids a running UI with a stale system
+    /// proxy pointing at a core that has already exited.
+    private func refreshSystemProxyEndpoint() {
+        let services = Self.networkServices()
+        guard !services.isEmpty else { return }
+        let failures = applySystemProxy(services: services)
+        if !failures.isEmpty { notice = "系统代理未能更新到当前核心：\(failures.sorted().joined(separator: "、"))" }
+    }
+
+    private func applySystemProxy(services: [String]) -> [String] {
+        var failures: [String] = []
+        for service in services {
+            let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
+            let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
+            if !web.success || !secure.success { failures.append(service) }
+        }
+        return failures
     }
 
     private func sampleTraffic() {
