@@ -12,12 +12,90 @@ struct StatCard: View {
     var body: some View { HStack(spacing: 14) { Image(systemName: icon).font(.title2).foregroundStyle(color).frame(width: 42, height: 42).background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 12)); VStack(alignment: .leading) { Text(title).foregroundStyle(.secondary).font(.caption); Text(value).font(.title2.bold()).lineLimit(1) }; Spacer() }.padding(18).background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.quaternary)) }
 }
 
+private struct ModeControl: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(ProxyMode.allCases) { mode in
+                Button { model.changeMode(mode) } label: {
+                    Text(mode.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(model.config.mode == mode ? .primary : .secondary)
+                        .frame(minWidth: 58, minHeight: 28)
+                        .background {
+                            if model.config.mode == mode {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(.background)
+                                    .shadow(color: .black.opacity(0.14), radius: 1, y: 1)
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("切换到\(mode.title)模式")
+            }
+        }
+        .padding(3)
+        .background(.quinary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(.quaternary))
+    }
+}
+
+private struct SystemProxyControl: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "network")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(model.systemProxy ? Color.accentColor : .secondary)
+            Text("系统代理")
+                .font(.system(size: 13, weight: .medium))
+            Toggle("系统代理", isOn: Binding(get: { model.systemProxy }, set: { model.setSystemProxy($0) }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+        }
+        .padding(.leading, 11)
+        .padding(.trailing, 8)
+        .frame(height: 38)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(.quaternary))
+    }
+}
+
+private struct ProxyPowerButton: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Button { model.toggleServer() } label: {
+            HStack(spacing: 8) {
+                Image(systemName: model.running ? "stop.fill" : "power")
+                    .font(.system(size: 13, weight: .bold))
+                Text(model.running ? "停止代理" : "启动代理")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(.white)
+            .frame(minWidth: 118, minHeight: 38)
+            .background(model.running ? Color.red.gradient : Color.accentColor.gradient, in: Capsule())
+            .shadow(color: (model.running ? Color.red : Color.accentColor).opacity(0.25), radius: 5, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(model.running ? "停止代理" : "启动代理")
+    }
+}
+
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 22) {
             Header(title: "网络概览", subtitle: "实时查看流量、连接与自动分流状态")
-            HStack { Picker("模式", selection: Binding(get: { model.config.mode }, set: { model.changeMode($0) })) { ForEach(ProxyMode.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).frame(width: 310); Spacer(); Toggle("系统代理", isOn: Binding(get: { model.systemProxy }, set: { model.setSystemProxy($0) })).toggleStyle(.switch); Button { model.toggleServer() } label: { Label(model.running ? "停止代理" : "启动代理", systemImage: model.running ? "stop.fill" : "power").font(.title3.bold()).frame(minWidth: 112, minHeight: 32) }.buttonStyle(.borderedProminent).controlSize(.large).tint(model.running ? .red : .accentColor) }
+            HStack(spacing: 12) {
+                ModeControl()
+                Spacer(minLength: 20)
+                SystemProxyControl()
+                ProxyPowerButton()
+            }
             LazyVGrid(columns: [.init(.flexible()), .init(.flexible()), .init(.flexible()), .init(.flexible())], spacing: 14) {
                 StatCard(title: "代理状态", value: model.running ? "已运行" : "已停止", icon: "bolt.shield.fill", color: model.running ? .green : .gray)
                 StatCard(title: "上传流量", value: bytes(model.totalUpload), icon: "arrow.up", color: .orange)
