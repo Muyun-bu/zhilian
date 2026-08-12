@@ -1,0 +1,23 @@
+# macOS metadata
+.DS_Store
+*.swp
+
+# Local build products and compiler caches
+/build/
+/native/build/
+/.build-current/
+/.build-cache/
+/outputs/
+*.dmg
+*.zip
+
+# Local runtime data. This includes subscription URLs, access tokens, cached profiles,
+# controller secrets and runtime logs, and must never be committed.
+config.json
+Providers/
+Core-*/
+*.log
+
+# Test/editor artifacts
+/tmp/
+coverage/

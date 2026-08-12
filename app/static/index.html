@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>智连</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><span></span></div>
+        <div><strong>智连</strong><small>智能网络工作台</small></div>
+      </div>
+
+      <nav id="nav">
+        <button class="nav-item active" data-page="overview"><span class="nav-icon">⌁</span>概览</button>
+        <button class="nav-item" data-page="connections"><span class="nav-icon">↗</span>连接</button>
+        <button class="nav-item" data-page="nodes"><span class="nav-icon">◇</span>节点</button>
+        <button class="nav-item" data-page="subscriptions"><span class="nav-icon">↻</span>订阅</button>
+        <button class="nav-item" data-page="rules"><span class="nav-icon">⑂</span>分流规则</button>
+        <button class="nav-item" data-page="settings"><span class="nav-icon">⚙</span>设置</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="core-state"><i id="coreDot"></i><span><b id="coreText">正在连接</b><small id="corePort">127.0.0.1:7890</small></span></div>
+        <button id="proxyToggle" class="power-button" aria-label="启动或停止代理"><span>⏻</span></button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="pageEyebrow">NETWORK OVERVIEW</p>
+          <h1 id="pageTitle">网络概览</h1>
+        </div>
+        <div class="topbar-actions">
+          <div class="mode-switch" id="modeSwitch">
+            <button data-mode="rule" class="active">规则</button>
+            <button data-mode="global">全局</button>
+            <button data-mode="direct">直连</button>
+          </div>
+          <button class="icon-button" id="refreshButton" title="刷新">↻</button>
+        </div>
+      </header>
+
+      <section class="page active" id="page-overview">
+        <div class="hero-grid">
+          <article class="status-card">
+            <div class="status-head"><span class="label">当前状态</span><span id="systemBadge" class="pill muted">系统代理未启用</span></div>
+            <div class="status-orb" id="statusOrb"><div class="orb-ring"></div><div class="orb-core"><span>FLOW</span><b id="orbStatus">运行中</b></div></div>
+            <div class="status-actions">
+              <button id="systemProxyButton" class="primary-button">启用系统代理</button>
+              <p>仅监听本机，HTTP 与 HTTPS 流量将按规则自动分流</p>
+            </div>
+          </article>
+
+          <article class="traffic-card panel">
+            <div class="panel-head">
+              <div><span class="label">实时速度</span><h2>网络流量</h2></div>
+              <div class="legend"><span><i class="down-dot"></i>下载 <b id="downSpeed">0 B/s</b></span><span><i class="up-dot"></i>上传 <b id="upSpeed">0 B/s</b></span></div>
+            </div>
+            <canvas id="trafficChart" height="220"></canvas>
+            <div class="traffic-totals"><div><span>总下载</span><b id="totalDown">0 B</b></div><div><span>总上传</span><b id="totalUp">0 B</b></div><div><span>活动连接</span><b id="activeCount">0</b></div><div><span>运行时间</span><b id="uptime">00:00:00</b></div></div>
+          </article>
+        </div>
+
+        <div class="content-grid">
+          <article class="panel node-focus">
+            <div class="panel-head"><div><span class="label">当前出口</span><h2>已选节点</h2></div><button class="text-button" data-goto="nodes">管理节点 →</button></div>
+            <div id="selectedNode" class="selected-node empty"></div>
+          </article>
+          <article class="panel route-summary">
+            <div class="panel-head"><div><span class="label">流量决策</span><h2>分流概况</h2></div></div>
+            <div id="routeBars" class="route-bars"></div>
+          </article>
+        </div>
+
+        <article class="panel connection-preview">
+          <div class="panel-head"><div><span class="label">LIVE FEED</span><h2>最近连接</h2></div><button class="text-button" data-goto="connections">查看全部 →</button></div>
+          <div class="table-wrap"><table><thead><tr><th>目标</th><th>识别类型</th><th>决策</th><th>规则 / 节点</th><th>流量</th><th>状态</th></tr></thead><tbody id="recentPreview"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-connections">
+        <div class="metric-row">
+          <div class="metric"><span>活动连接</span><b id="metricActive">0</b></div>
+          <div class="metric"><span>累计连接</span><b id="metricTotal">0</b></div>
+          <div class="metric"><span>代理流量</span><b id="metricProxy">0</b></div>
+          <div class="metric"><span>直连流量</span><b id="metricDirect">0</b></div>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><span class="label">CONNECTION LOG</span><h2>连接记录</h2></div><input id="connectionSearch" class="search-input" placeholder="搜索域名或规则"></div>
+          <div class="table-wrap tall"><table><thead><tr><th>时间</th><th>目标</th><th>类型</th><th>动作</th><th>命中规则</th><th>节点</th><th>上传 / 下载</th><th>状态</th></tr></thead><tbody id="connectionTable"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="page" id="page-nodes">
+        <div class="section-toolbar"><div><p>选择一个 SS、HTTP 或 SOCKS5 节点作为规则与全局模式的出口。</p></div><button class="primary-button" data-modal="nodeModal">＋ 手动添加</button></div>
+        <div id="nodeGrid" class="card-grid"></div>
+      </section>
+
+      <section class="page" id="page-subscriptions">
+        <div class="section-toolbar"><div><p>订阅会在本机解析；地址与凭据不会上传到第三方。</p></div><button class="primary-button" data-modal="subscriptionModal">＋ 添加订阅</button></div>
+        <div id="subscriptionList" class="stack-list"></div>
+      </section>
+
+      <section class="page" id="page-rules">
+        <div class="section-toolbar"><div><p>从上到下匹配，首条命中的规则决定 DIRECT、PROXY 或 REJECT。</p></div><button class="primary-button" data-modal="ruleModal">＋ 新建规则</button></div>
+        <article class="panel"><div class="rule-list" id="ruleList"></div></article>
+      </section>
+
+      <section class="page" id="page-settings">
+        <div class="settings-grid">
+          <article class="panel settings-card">
+            <span class="label">本地端口</span><h2>代理入口</h2>
+            <div class="setting-line"><span><b>HTTP / HTTPS</b><small>浏览器与系统代理统一入口</small></span><code id="proxyAddress">127.0.0.1:7890</code></div>
+            <div class="setting-line"><span><b>控制面板</b><small>仅限本机访问</small></span><code id="dashboardAddress">127.0.0.1:9090</code></div>
+          </article>
+          <article class="panel settings-card">
+            <span class="label">隐私与安全</span><h2>本机优先</h2>
+            <div class="check-row"><i>✓</i><span><b>回环地址绑定</b><small>局域网内其他设备无法访问代理或面板</small></span></div>
+            <div class="check-row"><i>✓</i><span><b>不解密 HTTPS</b><small>仅根据 CONNECT 目标域名分流，不进行中间人解密</small></span></div>
+            <div class="check-row"><i>✓</i><span><b>配置本机存储</b><small>保存在 Library/Application Support/Zhilian</small></span></div>
+          </article>
+          <article class="panel settings-card wide ipdb-card">
+            <div><span class="label">IP GEOLOCATION</span><h2>中国服务器 IP 段库</h2><p id="ipdbMeta">正在读取本地数据库…</p></div>
+            <div class="ipdb-actions"><span id="ipdbStatus" class="pill muted">未就绪</span><button id="ipdbUpdateButton" class="secondary-button">更新数据库</button></div>
+          </article>
+          <article class="panel settings-card wide">
+            <span class="label">使用说明</span><h2>接管系统流量</h2>
+            <ol class="steps"><li><b>启动本地核心</b><span>左侧状态显示“运行中”后继续。</span></li><li><b>添加节点或订阅</b><span>选择一个可用的 SS / HTTP / SOCKS5 出口。</span></li><li><b>启用系统代理</b><span>回到概览点击按钮，智连会设置当前网络服务。</span></li></ol>
+          </article>
+          <article class="panel settings-card wide danger-zone">
+            <div><span class="label">应用控制</span><h2>安全退出</h2><p>退出前会自动关闭由智连接管的系统代理，避免网络设置残留。</p></div>
+            <button id="shutdownButton" class="danger-button">退出智连</button>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-stack" id="toasts"></div>
+
+  <dialog id="subscriptionModal" class="modal">
+    <form method="dialog" id="subscriptionForm">
+      <div class="modal-head"><div><span class="label">REMOTE PROFILE</span><h2>添加订阅</h2></div><button value="cancel" class="close-button">×</button></div>
+      <label>订阅名称<input name="name" placeholder="例如：我的订阅"></label>
+      <label>订阅地址<input name="url" type="url" placeholder="https://example.com/subscribe" required></label>
+      <p class="form-note">支持 JSON、Clash YAML、Base64 URI 列表；当前内核可连接 SS（chacha20-ietf-poly1305）、HTTP 与 SOCKS5 节点。</p>
+      <div class="modal-actions"><button value="cancel" class="secondary-button">取消</button><button value="default" class="primary-button">添加并更新</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="nodeModal" class="modal">
+    <form method="dialog" id="nodeForm">
+      <div class="modal-head"><div><span class="label">MANUAL OUTBOUND</span><h2>手动添加节点</h2></div><button value="cancel" class="close-button">×</button></div>
+      <div class="field-row"><label>名称<input name="name" placeholder="办公代理"></label><label>类型<select name="type"><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></label></div>
+      <div class="field-row"><label>服务器<input name="host" placeholder="proxy.example.com" required></label><label>端口<input name="port" type="number" min="1" max="65535" value="1080" required></label></div>
+      <div class="field-row"><label>用户名<input name="username" autocomplete="off"></label><label>密码<input name="password" type="password" autocomplete="new-password"></label></div>
+      <div class="modal-actions"><button value="cancel" class="secondary-button">取消</button><button value="default" class="primary-button">保存节点</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="ruleModal" class="modal">
+    <form method="dialog" id="ruleForm">
+      <div class="modal-head"><div><span class="label">ROUTING RULE</span><h2>新建分流规则</h2></div><button value="cancel" class="close-button">×</button></div>
+      <label>规则名称<input name="name" placeholder="例如：公司内网直连"></label>
+      <div class="field-row"><label>匹配类型<select name="type"><option value="domain">完整域名</option><option value="suffix">域名后缀</option><option value="keyword">域名关键字</option><option value="regex">正则表达式</option><option value="port">目标端口</option><option value="cidr">IP CIDR</option><option value="category">流量类别</option></select></label><label>动作<select name="action"><option value="DIRECT">DIRECT</option><option value="PROXY">PROXY</option><option value="REJECT">REJECT</option></select></label></div>
+      <label>匹配内容<input name="value" placeholder="例如：example.com" required></label>
+      <div class="modal-actions"><button value="cancel" class="secondary-button">取消</button><button value="default" class="primary-button">添加规则</button></div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>
