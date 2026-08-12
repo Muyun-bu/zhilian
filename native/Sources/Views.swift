@@ -17,7 +17,7 @@ struct DashboardView: View {
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 22) {
             Header(title: "网络概览", subtitle: "实时查看流量、连接与自动分流状态")
-            HStack { Picker("模式", selection: $model.config.mode) { ForEach(ProxyMode.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).frame(width: 310).onChange(of: model.config.mode) { _ in model.save() }; Spacer(); Toggle("系统代理", isOn: Binding(get: { model.systemProxy }, set: { model.setSystemProxy($0) })).toggleStyle(.switch); Button { model.toggleServer() } label: { Label(model.running ? "停止代理" : "启动代理", systemImage: model.running ? "stop.fill" : "power").font(.title3.bold()).frame(minWidth: 112, minHeight: 32) }.buttonStyle(.borderedProminent).controlSize(.large).tint(model.running ? .red : .accentColor) }
+            HStack { Picker("模式", selection: Binding(get: { model.config.mode }, set: { model.changeMode($0) })) { ForEach(ProxyMode.allCases) { Text($0.title).tag($0) } }.pickerStyle(.segmented).frame(width: 310); Spacer(); Toggle("系统代理", isOn: Binding(get: { model.systemProxy }, set: { model.setSystemProxy($0) })).toggleStyle(.switch); Button { model.toggleServer() } label: { Label(model.running ? "停止代理" : "启动代理", systemImage: model.running ? "stop.fill" : "power").font(.title3.bold()).frame(minWidth: 112, minHeight: 32) }.buttonStyle(.borderedProminent).controlSize(.large).tint(model.running ? .red : .accentColor) }
             LazyVGrid(columns: [.init(.flexible()), .init(.flexible()), .init(.flexible()), .init(.flexible())], spacing: 14) {
                 StatCard(title: "代理状态", value: model.running ? "已运行" : "已停止", icon: "bolt.shield.fill", color: model.running ? .green : .gray)
                 StatCard(title: "上传流量", value: bytes(model.totalUpload), icon: "arrow.up", color: .orange)
@@ -49,7 +49,7 @@ struct NodesView: View {
     private var protocols: [String] { ["全部协议"] + Array(Set(model.config.nodes.map { $0.type.uppercased() })).sorted() }
     private var regions: [String] { ["全部地区"] + Array(Set(model.config.nodes.map(nodeRegion))).sorted() }
     private var filteredNodes: [ProxyNode] { model.config.nodes.filter { (protocolFilter == "全部协议" || $0.type.uppercased() == protocolFilter) && (regionFilter == "全部地区" || nodeRegion($0) == regionFilter) } }
-    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "代理节点", subtitle: "按地区和协议分类，选择节点并检测真实连接延迟"); Button { Task { await model.testAllNodes() } } label: { Label(model.testingAll ? "测速中…" : "一键测速", systemImage: "speedometer") }.buttonStyle(.borderedProminent).controlSize(.large).disabled(model.testingAll || model.config.nodes.isEmpty) }
+    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "代理节点", subtitle: "真实 HTTP 延迟 · \(model.config.latencyTestTarget.title) · \(model.config.latencyTimeoutMilliseconds / 1_000) 秒超时"); Button { Task { await model.testAllNodes() } } label: { Label(model.testingAll ? "测速中…" : "一键测速", systemImage: "speedometer") }.buttonStyle(.borderedProminent).controlSize(.large).disabled(model.testingAll || model.config.nodes.isEmpty) }
         HStack(spacing: 12) { Picker("地区", selection: $regionFilter) { ForEach(regions, id: \.self) { Text("\($0) (\(count(region: $0)))").tag($0) } }.frame(width: 190); Picker("协议", selection: $protocolFilter) { ForEach(protocols, id: \.self) { Text("\($0) (\(count(protocol: $0)))").tag($0) } }.frame(width: 210); Spacer(); Text("显示 \(filteredNodes.count) / \(model.config.nodes.count) 个节点").foregroundStyle(.secondary) }
         Table(filteredNodes) {
         TableColumn("节点") { node in VStack(alignment: .leading) { Text(node.name).fontWeight(.semibold); Text("\(node.host):\(node.port)").font(.caption.monospaced()).foregroundStyle(.secondary) } }
@@ -106,11 +106,18 @@ struct SettingsView: View {
                 TextField("监听端口", value: $model.config.proxyPort, format: .number).onSubmit { model.save() }
                 Toggle("启动时开启本地代理", isOn: $model.config.proxyEnabled).onChange(of: model.config.proxyEnabled) { _ in model.save() }
             }
+            Section("真实测速") {
+                Picker("测试目标", selection: $model.config.latencyTestTarget) { ForEach(LatencyTestTarget.allCases) { Text($0.title).tag($0) } }.onChange(of: model.config.latencyTestTarget) { _ in model.save() }
+                Picker("超时时间", selection: $model.config.latencyTimeoutMilliseconds) {
+                    Text("5 秒").tag(5_000); Text("8 秒").tag(8_000); Text("12 秒").tag(12_000)
+                }.onChange(of: model.config.latencyTimeoutMilliseconds) { _ in model.save() }
+                Text("测速会让 Mihomo 通过节点访问所选 HTTP 目标；不同软件必须使用相同目标和超时设置才可横向比较。").font(.caption).foregroundStyle(.secondary)
+            }
             Section("隐私与安全") {
                 Label("订阅令牌只保存在本机应用数据目录", systemImage: "lock.shield")
                 Label("代理仅监听 127.0.0.1，不接受局域网连接", systemImage: "laptopcomputer.and.iphone")
             }
-            Section { Text("智连 0.4.6 · 原生 macOS 应用").foregroundStyle(.secondary) }
+            Section { Text("智连 0.5.0 · 原生 macOS 应用").foregroundStyle(.secondary) }
         }.formStyle(.grouped).padding()
     }
 }

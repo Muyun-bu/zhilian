@@ -13,7 +13,7 @@ final class ProxyServer: @unchecked Sendable {
     var onTraffic: @Sendable (UUID, Int64, Int64) -> Void = { _,_,_ in }
     var onClose: @Sendable (UUID, String?) -> Void = { _,_ in }
     private let router: RoutingEngine
-    private let queue = DispatchQueue(label: "app.zhilian.proxy.accept", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "app.zhilian.proxy.accept", qos: .utility)
     private var listener: Int32 = -1
     private var running = false
 
@@ -36,7 +36,14 @@ final class ProxyServer: @unchecked Sendable {
     private func acceptLoop() {
         while running {
             let client = accept(listener, nil, nil)
-            if client < 0 { continue }
+            if client < 0 {
+                // `accept` is unblocked when stop() closes the listener.  A small
+                // backoff also protects against a transient descriptor failure
+                // becoming a busy loop that consumes a full CPU core.
+                if !running { break }
+                Thread.sleep(forTimeInterval: 0.01)
+                continue
+            }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.handle(SocketFD(fd: client)) }
         }
     }

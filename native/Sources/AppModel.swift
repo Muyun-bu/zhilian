@@ -1,5 +1,28 @@
 import SwiftUI
 
+/// Proxy sockets can produce thousands of small read events each second. Keep
+/// those counters off the main actor and publish their aggregate only once per
+/// display tick, otherwise SwiftUI becomes the bottleneck during downloads.
+private final class TrafficAccumulator: @unchecked Sendable {
+    private struct Totals { var upload: Int64 = 0; var download: Int64 = 0 }
+    private let lock = NSLock()
+    private var pending: [UUID: Totals] = [:]
+
+    func add(id: UUID, upload: Int64, download: Int64) {
+        lock.lock()
+        pending[id, default: .init()].upload += upload
+        pending[id, default: .init()].download += download
+        lock.unlock()
+    }
+
+    func drain() -> [UUID: (upload: Int64, download: Int64)] {
+        lock.lock(); defer { lock.unlock() }
+        let result = pending.mapValues { (upload: $0.upload, download: $0.download) }
+        pending.removeAll(keepingCapacity: true)
+        return result
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var config: PersistedConfig
@@ -19,9 +42,13 @@ final class AppModel: ObservableObject {
     private var previousUpload: Int64 = 0
     private var previousDownload: Int64 = 0
     private var timer: Timer?
+    private let trafficAccumulator = TrafficAccumulator()
 
     var rules: [RoutingRule] { RoutingRule.builtIns + config.customRules }
     var selectedNode: ProxyNode? { config.nodes.first { $0.id == config.selectedNodeID } }
+    /// In rule/global modes, the system proxy points to mihomo directly. This
+    /// removes the UI process from the high-throughput packet forwarding path.
+    private var systemProxyPort: Int { config.mode != .direct && core.isRunning ? core.mixedPort : config.proxyPort }
 
     init() {
         let loadedConfig = ConfigStore().load()
@@ -38,10 +65,10 @@ final class AppModel: ObservableObject {
             self?.connections.insert(.init(id: id, host: host, port: port, category: decision.category, action: decision.action, rule: decision.reason, node: node), at: 0)
             if (self?.connections.count ?? 0) > 300 { self?.connections.removeLast() }
         }}
-        server.onTraffic = { [weak self] id, up, down in Task { @MainActor in
-            guard let self else { return }; self.totalUpload += up; self.totalDownload += down
-            if let index = self.connections.firstIndex(where: { $0.id == id }) { self.connections[index].uploaded += up; self.connections[index].downloaded += down }
-        }}
+        let trafficAccumulator = trafficAccumulator
+        server.onTraffic = { id, up, down in
+            trafficAccumulator.add(id: id, upload: up, download: down)
+        }
         server.onClose = { [weak self] id, error in Task { @MainActor in
             if let index = self?.connections.firstIndex(where: { $0.id == id }) { self?.connections[index].endedAt = Date(); self?.connections[index].status = error == nil ? "完成" : "失败" }
         }}
@@ -72,10 +99,19 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
-            do { try core.start(providerFile: cache, selectedNode: selectedNode?.name) }
+            do { try core.start(providerFile: cache, selectedNode: selectedNode?.name, mode: config.mode) }
             catch { notice = error.localizedDescription; return }
         } else if config.mode != .direct {
             notice = "请先添加并更新订阅，再启动代理"
+            return
+        }
+        // Mihomo owns the HTTP/SOCKS endpoint used by macOS system proxy.  The
+        // Swift proxy remains available only in direct mode for the detailed
+        // inspection panel, so normal proxy traffic never wakes this process.
+        if config.mode != .direct {
+            running = true
+            config.proxyEnabled = true
+            save()
             return
         }
         let requestedPort = config.proxyPort
@@ -111,7 +147,7 @@ final class AppModel: ObservableObject {
         } catch { config.subscriptions[index].lastError = error.localizedDescription; notice = error.localizedDescription }
         busy = false; save()
         if running, config.mode != .direct, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, forceReload: true) }
+            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode, forceReload: true) }
             catch { notice = "核心重载失败：\(error.localizedDescription)" }
         }
     }
@@ -121,13 +157,13 @@ final class AppModel: ObservableObject {
         guard let node = config.nodes.first(where: { $0.id == id }) else { return }
         guard node.supported else { return }
         if !core.isRunning, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name) }
+            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode) }
             catch { notice = error.localizedDescription; return }
         }
         let started = Date(); var latency: Int?; var failure: String?
         do {
             if core.isRunning {
-                latency = try await core.latency(node: node.name)
+                latency = try await core.latency(node: node.name, target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
             } else {
                 let tunnel: Tunnel = node.type == "ss" ? try ShadowsocksTunnel(node: node, destinationHost: "www.apple.com", destinationPort: 443) : try SocketFD.connect(host: node.host, port: node.port)
                 tunnel.close(); latency = Int(Date().timeIntervalSince(started) * 1000)
@@ -154,14 +190,14 @@ final class AppModel: ObservableObject {
     func testAllNodes(ids: [String]? = nil) async {
         guard !testingAll else { return }
         if !core.isRunning, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name) }
+            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode) }
             catch { notice = error.localizedDescription; return }
         }
         testingAll = true
         let targets = config.nodes.filter { $0.supported && (ids == nil || ids!.contains($0.id)) }
         guard !targets.isEmpty else { testingAll = false; notice = "没有可测速的节点"; return }
         do {
-            let latencies = try await core.groupLatencies()
+            let latencies = try await core.groupLatencies(target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
             for node in targets {
                 guard let index = config.nodes.firstIndex(where: { $0.id == node.id }) else { continue }
                 config.nodes[index].lastLatency = latencies[node.name]
@@ -204,8 +240,8 @@ final class AppModel: ObservableObject {
                 return .init(service: service, web: web, secureWeb: secure)
             }
             for service in services {
-                let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(config.proxyPort)"])
-                let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(config.proxyPort)"])
+                let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
+                let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
                 if !web.success || !secure.success { failures.append(service) }
             }
         } else {
@@ -226,7 +262,44 @@ final class AppModel: ObservableObject {
         if !failures.isEmpty { notice = "系统代理未能应用到：\(failures.sorted().joined(separator: "、"))" }
     }
 
-    private func sampleTraffic() { samples.append(.init(upload: totalUpload - previousUpload, download: totalDownload - previousDownload)); previousUpload = totalUpload; previousDownload = totalDownload; if samples.count > 60 { samples.removeFirst() } }
+    func changeMode(_ mode: ProxyMode) {
+        guard config.mode != mode else { return }
+        config.mode = mode
+        save()
+        guard running else { return }
+        if mode == .direct {
+            core.stopAndWait()
+            server.stop()
+            running = false
+            start()
+        } else {
+            server.stop()
+            guard let subscription = config.subscriptions.first else {
+                stop()
+                notice = "请先添加并更新订阅，再切换代理模式"
+                return
+            }
+            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: mode, forceReload: true) }
+            catch { notice = "切换模式失败：\(error.localizedDescription)"; return }
+            if systemProxy { setSystemProxy(true) }
+        }
+    }
+
+    private func sampleTraffic() {
+        // This is the only point where network traffic updates SwiftUI state.
+        for (id, delta) in trafficAccumulator.drain() {
+            totalUpload += delta.upload
+            totalDownload += delta.download
+            if let index = connections.firstIndex(where: { $0.id == id }) {
+                connections[index].uploaded += delta.upload
+                connections[index].downloaded += delta.download
+            }
+        }
+        samples.append(.init(upload: totalUpload - previousUpload, download: totalDownload - previousDownload))
+        previousUpload = totalUpload
+        previousDownload = totalDownload
+        if samples.count > 60 { samples.removeFirst() }
+    }
     private func providerCacheURL(_ subscriptionID: String) -> URL {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ZhilianNative/Providers", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

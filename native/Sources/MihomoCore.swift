@@ -5,9 +5,13 @@ final class MihomoCore: @unchecked Sendable {
     private static let groupName = "智连节点"
     let socksPort: Int
     let controllerPort: Int
+    /// HTTP and SOCKS listener owned directly by mihomo. System proxy traffic
+    /// must use this port instead of passing through the Swift inspection proxy.
+    let mixedPort: Int
     private let secret = UUID().uuidString
     private var process: Process?
     private var currentProviderPath: String?
+    private var currentMode: ProxyMode?
     private var logHandle: FileHandle?
     private var logURL: URL?
     private let executableOverride: URL?
@@ -18,6 +22,7 @@ final class MihomoCore: @unchecked Sendable {
         let base = 20_000 + (Int(ProcessInfo.processInfo.processIdentifier) % 10_000) * 2
         socksPort = base
         controllerPort = base + 1
+        mixedPort = base + 2
         self.executableOverride = executableOverride
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
@@ -31,9 +36,9 @@ final class MihomoCore: @unchecked Sendable {
     /// traffic to a core that has not finished loading the provider yet.
     var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return process?.isRunning == true }
 
-    func start(providerFile: URL, selectedNode: String?, forceReload: Bool = false) throws {
+    func start(providerFile: URL, selectedNode: String?, mode: ProxyMode = .rule, forceReload: Bool = false) throws {
         lock.lock()
-        let alreadyRunning = !forceReload && process?.isRunning == true && currentProviderPath == providerFile.path
+        let alreadyRunning = !forceReload && process?.isRunning == true && currentProviderPath == providerFile.path && currentMode == mode
         lock.unlock()
         if alreadyRunning {
             if let selectedNode { Task { try? await self.select(node: selectedNode) } }
@@ -52,7 +57,7 @@ final class MihomoCore: @unchecked Sendable {
         try Data(contentsOf: providerFile).write(to: localProvider, options: .atomic)
         let configURL = support.appendingPathComponent("config.yaml")
         let config = Self.configuration(providerPath: "./providers/zhilian.yaml", socksPort: socksPort,
-                                        controllerPort: controllerPort, secret: secret)
+                                        mixedPort: mixedPort, controllerPort: controllerPort, secret: secret, mode: mode)
         try Data(config.utf8).write(to: configURL, options: .atomic)
         let coreLog = support.appendingPathComponent("core.log")
         try Data().write(to: coreLog, options: .atomic)
@@ -66,8 +71,9 @@ final class MihomoCore: @unchecked Sendable {
         var ready = false
         for _ in 0..<100 {
             let socksReady = (try? SocketFD.connect(host: "127.0.0.1", port: socksPort, timeout: 1)) != nil
+            let mixedReady = (try? SocketFD.connect(host: "127.0.0.1", port: mixedPort, timeout: 1)) != nil
             let controllerReady = (try? SocketFD.connect(host: "127.0.0.1", port: controllerPort, timeout: 1)) != nil
-            if socksReady && controllerReady { ready = true; break }
+            if socksReady && mixedReady && controllerReady { ready = true; break }
             if !task.isRunning { break }
             Thread.sleep(forTimeInterval: 0.1)
         }
@@ -79,6 +85,7 @@ final class MihomoCore: @unchecked Sendable {
         lock.lock()
         process = task
         currentProviderPath = providerFile.path
+        currentMode = mode
         logHandle = output
         logURL = coreLog
         lock.unlock()
@@ -86,13 +93,13 @@ final class MihomoCore: @unchecked Sendable {
     }
 
     func stop() {
-        lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; logHandle = nil; logURL = nil; lock.unlock()
+        lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; currentMode = nil; logHandle = nil; logURL = nil; lock.unlock()
         if task?.isRunning == true { task?.terminate() }
         output?.closeFile()
     }
 
     func stopAndWait() {
-        lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; logHandle = nil; logURL = nil; lock.unlock()
+        lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; currentMode = nil; logHandle = nil; logURL = nil; lock.unlock()
         if let task, task.isRunning {
             task.terminate()
             task.waitUntilExit()
@@ -106,9 +113,9 @@ final class MihomoCore: @unchecked Sendable {
         _ = try await request(path: "/proxies/\(Self.escapedPath(Self.groupName))", method: "PUT", body: body)
     }
 
-    func latency(node: String) async throws -> Int {
+    func latency(node: String, target: LatencyTestTarget = .google204, timeoutMilliseconds: Int = 8_000) async throws -> Int {
         try await waitUntilAvailable(node: node)
-        let data = try await request(path: Self.providerHealthcheckPath(node: node), method: "GET", body: nil, timeout: 12)
+        let data = try await request(path: Self.providerHealthcheckPath(node: node, target: target, timeoutMilliseconds: timeoutMilliseconds), method: "GET", body: nil, timeout: TimeInterval(timeoutMilliseconds) / 1_000 + 4)
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let delay = json?["delay"] as? Int, delay > 0 else { throw TunnelError.connect("测速失败") }
         return delay
@@ -116,11 +123,11 @@ final class MihomoCore: @unchecked Sendable {
 
     /// Asks mihomo to probe the whole selected group once.  This is both faster and less
     /// error-prone than opening a simultaneous controller request for every provider node.
-    func groupLatencies() async throws -> [String: Int] {
+    func groupLatencies(target: LatencyTestTarget = .google204, timeoutMilliseconds: Int = 8_000) async throws -> [String: Int] {
         try await waitUntilAvailable(node: nil)
-        let query = Self.delayQuery()
+        let query = Self.delayQuery(target: target, timeoutMilliseconds: timeoutMilliseconds)
         let path = "/group/\(Self.escapedPath(Self.groupName))/delay?\(query)"
-        let data = try await request(path: path, method: "GET", body: nil, timeout: 20)
+        let data = try await request(path: path, method: "GET", body: nil, timeout: TimeInterval(timeoutMilliseconds) / 1_000 + 8)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw TunnelError.connect("核心返回的测速结果无效")
         }
@@ -159,10 +166,37 @@ final class MihomoCore: @unchecked Sendable {
         return data
     }
 
-    private static func configuration(providerPath: String, socksPort: Int, controllerPort: Int, secret: String) -> String {
+    private static func configuration(providerPath: String, socksPort: Int, mixedPort: Int, controllerPort: Int, secret: String, mode: ProxyMode) -> String {
         func quoted(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "''") + "'" }
+        let routingRules: String
+        if mode == .global {
+            routingRules = "          - MATCH,智连节点"
+        } else {
+            routingRules = """
+                      - DOMAIN-SUFFIX,cn,DIRECT
+                      - DOMAIN-SUFFIX,baidu.com,DIRECT
+                      - DOMAIN-SUFFIX,qq.com,DIRECT
+                      - DOMAIN-SUFFIX,wechat.com,DIRECT
+                      - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+                      - DOMAIN-SUFFIX,taobao.com,DIRECT
+                      - DOMAIN-SUFFIX,tmall.com,DIRECT
+                      - DOMAIN-SUFFIX,jd.com,DIRECT
+                      - DOMAIN-SUFFIX,bilibili.com,DIRECT
+                      - DOMAIN-SUFFIX,douyin.com,DIRECT
+                      - DOMAIN-SUFFIX,zhihu.com,DIRECT
+                      - DOMAIN-SUFFIX,weibo.com,DIRECT
+                      - DOMAIN-SUFFIX,aliyun.com,DIRECT
+                      - DOMAIN-SUFFIX,163.com,DIRECT
+                      - DOMAIN-SUFFIX,xiaomi.com,DIRECT
+                      - DOMAIN-SUFFIX,meituan.com,DIRECT
+                      - DOMAIN-SUFFIX,amap.com,DIRECT
+                      - DOMAIN-SUFFIX,alipay.com,DIRECT
+                      - MATCH,智连节点
+            """
+        }
         return """
         socks-port: \(socksPort)
+        mixed-port: \(mixedPort)
         allow-lan: false
         bind-address: 127.0.0.1
         mode: rule
@@ -184,7 +218,7 @@ final class MihomoCore: @unchecked Sendable {
             use:
               - zhilian-subscription
         rules:
-          - MATCH,智连节点
+        \(routingRules)
         """
     }
 
@@ -194,17 +228,17 @@ final class MihomoCore: @unchecked Sendable {
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
     }
 
-    private static func delayQuery() -> String {
+    private static func delayQuery(target: LatencyTestTarget = .google204, timeoutMilliseconds: Int = 8_000) -> String {
         var components = URLComponents()
         components.queryItems = [
-            URLQueryItem(name: "timeout", value: "8000"),
-            URLQueryItem(name: "url", value: "https://www.gstatic.com/generate_204")
+            URLQueryItem(name: "timeout", value: "\(min(30_000, max(1_000, timeoutMilliseconds)))"),
+            URLQueryItem(name: "url", value: target.url)
         ]
         return components.percentEncodedQuery ?? "timeout=8000"
     }
 
-    private static func providerHealthcheckPath(node: String) -> String {
-        "/providers/proxies/\(escapedPath(providerName))/\(escapedPath(node))/healthcheck?\(delayQuery())"
+    private static func providerHealthcheckPath(node: String, target: LatencyTestTarget, timeoutMilliseconds: Int) -> String {
+        "/providers/proxies/\(escapedPath(providerName))/\(escapedPath(node))/healthcheck?\(delayQuery(target: target, timeoutMilliseconds: timeoutMilliseconds))"
     }
 
     private static func startupDiagnostic(from logURL: URL) -> String {

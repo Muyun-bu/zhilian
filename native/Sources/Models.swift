@@ -8,6 +8,18 @@ enum ProxyMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum LatencyTestTarget: String, Codable, CaseIterable, Identifiable {
+    case google204, cloudflareTrace
+    var id: String { rawValue }
+    var title: String { self == .google204 ? "Google 204" : "Cloudflare Trace" }
+    var url: String {
+        switch self {
+        case .google204: "https://www.gstatic.com/generate_204"
+        case .cloudflareTrace: "https://www.cloudflare.com/cdn-cgi/trace"
+        }
+    }
+}
+
 enum RouteAction: String, Codable, CaseIterable, Identifiable {
     case direct = "DIRECT"
     case proxy = "PROXY"
@@ -117,6 +129,8 @@ struct PersistedConfig: Codable {
     var nodes: [ProxyNode] = []
     var subscriptions: [SubscriptionProfile] = []
     var customRules: [RoutingRule] = []
+    var latencyTestTarget: LatencyTestTarget = .google204
+    var latencyTimeoutMilliseconds = 8_000
     var systemProxyEnabled = false
     var systemProxyBackups: [SystemProxyBackup] = []
 
@@ -133,6 +147,8 @@ struct PersistedConfig: Codable {
         nodes = try values.decodeIfPresent([ProxyNode].self, forKey: .nodes) ?? []
         subscriptions = try values.decodeIfPresent([SubscriptionProfile].self, forKey: .subscriptions) ?? []
         customRules = try values.decodeIfPresent([RoutingRule].self, forKey: .customRules) ?? []
+        latencyTestTarget = try values.decodeIfPresent(LatencyTestTarget.self, forKey: .latencyTestTarget) ?? .google204
+        latencyTimeoutMilliseconds = try values.decodeIfPresent(Int.self, forKey: .latencyTimeoutMilliseconds) ?? 8_000
         systemProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .systemProxyEnabled) ?? false
         systemProxyBackups = try values.decodeIfPresent([SystemProxyBackup].self, forKey: .systemProxyBackups) ?? []
     }
