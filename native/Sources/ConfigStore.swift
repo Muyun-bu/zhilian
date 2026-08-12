@@ -25,13 +25,8 @@ final class ConfigStore {
 
     func save(_ config: PersistedConfig) {
         guard let data = try? encoder.encode(config) else { return }
-        let temporary = fileURL.appendingPathExtension("tmp")
-        do {
-            try data.write(to: temporary, options: .atomic)
-            if FileManager.default.fileExists(atPath: fileURL.path) { try FileManager.default.removeItem(at: fileURL) }
-            try FileManager.default.moveItem(at: temporary, to: fileURL)
-        } catch {
-            try? data.write(to: fileURL, options: .atomic)
-        }
+        // Foundation's atomic write performs a same-directory replacement and
+        // never exposes a moment where config.json is missing.
+        try? data.write(to: fileURL, options: .atomic)
     }
 }

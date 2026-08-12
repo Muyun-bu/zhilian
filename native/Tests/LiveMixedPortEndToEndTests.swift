@@ -26,22 +26,35 @@ struct LiveMixedPortEndToEndTests {
         for selected in candidates {
             do {
                 try await core.select(node: selected)
-                try connectThroughHTTPProxy(port: core.mixedPort, host: "example.com", destinationPort: 443)
-                print("PASS: mihomo mixed-port 已通过节点 \(selected) 建立 example.com 的 HTTPS 隧道")
+                let proxyClient = try connectThroughHTTPProxy(port: core.mixedPort, host: "example.com", destinationPort: 443)
+                let directClient = try connectThroughHTTPProxy(port: core.mixedPort, host: "114.114.114.114", destinationPort: 53)
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                let snapshot = try await core.connectionSnapshot()
+                guard snapshot.connections.contains(where: { $0.host == "example.com" && $0.action == .proxy }) else {
+                    proxyClient.close(); directClient.close()
+                    throw TunnelError.protocolError("核心连接快照未记录代理连接")
+                }
+                guard snapshot.connections.contains(where: { $0.host == "114.114.114.114" && $0.action == .direct }) else {
+                    proxyClient.close(); directClient.close()
+                    throw TunnelError.protocolError("中国服务器 IP 未按本地 CIDR 规则直连")
+                }
+                proxyClient.close(); directClient.close()
+                print("PASS: 境外 example.com 已通过节点 \(selected) 代理，中国 IP 114.114.114.114 已直连，连接快照真实可读")
                 return
             } catch { firstFailure = error }
         }
         throw firstFailure ?? TunnelError.connect("所有已测速节点均无法通过 mixed-port 建立 HTTPS 隧道")
     }
 
-    private static func connectThroughHTTPProxy(port: Int, host: String, destinationPort: Int) throws {
+    private static func connectThroughHTTPProxy(port: Int, host: String, destinationPort: Int) throws -> SocketFD {
         let client = try SocketFD.connect(host: "127.0.0.1", port: port, timeout: 15)
-        defer { client.close() }
         try client.write(Data("CONNECT \(host):\(destinationPort) HTTP/1.1\r\nHost: \(host):\(destinationPort)\r\nProxy-Connection: keep-alive\r\n\r\n".utf8))
         let response = try client.read(max: 4096)
         let text = String(data: response, encoding: .utf8) ?? ""
         guard text.hasPrefix("HTTP/"), text.contains(" 200 ") else {
+            client.close()
             throw TunnelError.protocolError("mixed-port 没有建立 HTTPS 隧道：\(text)")
         }
+        return client
     }
 }

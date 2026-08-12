@@ -1,4 +1,5 @@
 import SwiftUI
+import SystemConfiguration
 
 /// Proxy sockets can produce thousands of small read events each second. Keep
 /// those counters off the main actor and publish their aggregate only once per
@@ -32,9 +33,11 @@ final class AppModel: ObservableObject {
     @Published var samples: [TrafficSample] = []
     @Published var totalUpload: Int64 = 0
     @Published var totalDownload: Int64 = 0
+    @Published var coreMemory: Int64 = 0
     @Published var notice: String?
     @Published var busy = false
     @Published var testingAll = false
+    @Published private(set) var testingNodeIDs: Set<String> = []
     let store = ConfigStore()
     private let server: ProxyServer
     private let subscriptionService = SubscriptionService()
@@ -42,10 +45,22 @@ final class AppModel: ObservableObject {
     private var previousUpload: Int64 = 0
     private var previousDownload: Int64 = 0
     private var timer: Timer?
+    private var pollingCore = false
+    private var coreSnapshotFailures = 0
+    private var coreRecoveryAttempted = false
+    private var networkGeneration = 0
+    private var proxyOwnershipCheckTicks = 0
+    private var proxyOwnershipGraceUntil = Date.distantPast
+    private var lastAppliedSystemProxyPort: Int?
+    private var terminationObserver: NSObjectProtocol?
     private let trafficAccumulator = TrafficAccumulator()
 
     var rules: [RoutingRule] { RoutingRule.builtIns + config.customRules }
     var selectedNode: ProxyNode? { config.nodes.first { $0.id == config.selectedNodeID } }
+    var runtimeProxyDescription: String {
+        guard running else { return "未监听" }
+        return config.mode != .direct ? "Mihomo · 127.0.0.1:\(core.mixedPort)" : "HTTP · 127.0.0.1:\(config.proxyPort)"
+    }
     /// In rule/global modes, the system proxy points to mihomo directly. This
     /// removes the UI process from the high-throughput packet forwarding path.
     private var systemProxyPort: Int { config.mode != .direct && core.isRunning ? core.mixedPort : config.proxyPort }
@@ -53,7 +68,9 @@ final class AppModel: ObservableObject {
     init() {
         let loadedConfig = ConfigStore().load()
         config = loadedConfig
-        systemProxy = loadedConfig.systemProxyEnabled
+        // `systemProxyEnabled` is the user's persisted preference. Runtime
+        // state becomes true only after macOS confirms the new endpoint.
+        systemProxy = false
         let ipURL = Bundle.main.url(forResource: "china-ip-ranges", withExtension: "txt")
         let router = RoutingEngine(database: IPDatabase(resourceURL: ipURL))
         server = ProxyServer(router: router)
@@ -72,15 +89,28 @@ final class AppModel: ObservableObject {
         server.onClose = { [weak self] id, error in Task { @MainActor in
             if let index = self?.connections.firstIndex(where: { $0.id == id }) { self?.connections[index].endedAt = Date(); self?.connections[index].status = error == nil ? "完成" : "失败" }
         }}
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.sampleTraffic() } }
-        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.shutdownForTermination() }
+        timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.updateNetworkPanel() }
+        }
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
+        terminationObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            // The notification is already delivered on the main queue. Run
+            // synchronously so the app cannot exit before restoring the proxy
+            // and terminating its child core.
+            MainActor.assumeIsolated { self?.shutdownForTermination() }
+        }
+        // A crash can leave macOS pointing at a dead local port. If the user
+        // did not ask Zhilian to re-enable system proxy on this launch, restore
+        // the saved pre-Zhilian settings before doing anything online.
+        if (!config.systemProxyEnabled || !config.proxyEnabled), !config.systemProxyBackups.isEmpty {
+            setSystemProxy(false)
         }
         if config.mode != .direct, !config.subscriptions.isEmpty {
             // Start from the saved provider first.  Waiting for an online refresh
             // here can deadlock startup when macOS still points at a former local
             // proxy port; start() immediately rebinds system proxy to this core.
-            if config.proxyEnabled { start() }
+            if config.proxyEnabled, let subscription = config.subscriptions.first,
+               FileManager.default.fileExists(atPath: providerCacheURL(subscription.id).path) { start() }
             Task { [weak self] in
                 guard let self else { return }
                 for subscription in self.config.subscriptions { await self.refreshSubscription(subscription.id) }
@@ -92,19 +122,35 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
+        guard !busy, !testingAll, testingNodeIDs.isEmpty else {
+            notice = "请等待当前操作完成后再启动代理"
+            return
+        }
         if config.mode != .direct, let subscription = config.subscriptions.first {
             let cache = providerCacheURL(subscription.id)
             guard FileManager.default.fileExists(atPath: cache.path) else {
                 notice = "正在更新订阅，完成后自动启动代理"
-                Task { [weak self] in
-                    guard let self else { return }
-                    await self.refreshSubscription(subscription.id)
-                    if self.config.subscriptions.first?.lastError == nil { self.start() }
+                config.proxyEnabled = true
+                save()
+                if !busy {
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.refreshSubscription(subscription.id)
+                        if FileManager.default.fileExists(atPath: cache.path),
+                           self.config.proxyEnabled, !self.running,
+                           self.config.subscriptions.first?.lastError == nil {
+                            self.start()
+                        } else if !FileManager.default.fileExists(atPath: cache.path) {
+                            self.config.proxyEnabled = false
+                            self.config.systemProxyEnabled = false
+                            self.save()
+                        }
+                    }
                 }
                 return
             }
             do { try core.start(providerFile: cache, selectedNode: selectedNode?.name, mode: config.mode) }
-            catch { notice = error.localizedDescription; return }
+            catch { failSafeAfterCoreFailure("代理核心启动失败：\(error.localizedDescription)"); return }
         } else if config.mode != .direct {
             notice = "请先添加并更新订阅，再启动代理"
             return
@@ -115,16 +161,21 @@ final class AppModel: ObservableObject {
         if config.mode != .direct {
             running = true
             config.proxyEnabled = true
+            resetNetworkPanel()
             save()
-            if systemProxy { refreshSystemProxyEndpoint() }
+            if config.systemProxyEnabled { setSystemProxy(true) }
             return
         }
         let requestedPort = config.proxyPort
-        for port in requestedPort...(requestedPort + 20) {
+        guard (1...65_535).contains(requestedPort) else {
+            running = false; config.proxyEnabled = false; notice = "监听端口必须在 1 到 65535 之间"; save(); return
+        }
+        let lastPort = min(65_535, requestedPort + 20)
+        for port in requestedPort...lastPort {
             do {
                 try server.start(port: port)
                 config.proxyPort = port; running = true; config.proxyEnabled = true; save()
-                if systemProxy { refreshSystemProxyEndpoint() }
+                if config.systemProxyEnabled { setSystemProxy(true) }
                 if port != requestedPort { notice = "端口 \(requestedPort) 被占用，已自动切换到 \(port)" }
                 return
             } catch { continue }
@@ -132,52 +183,130 @@ final class AppModel: ObservableObject {
         running = false; config.proxyEnabled = false; notice = "无法找到可用的本地代理端口"
     }
     /// Explicit user action.  It also disables auto-start for the next launch.
-    func stop() { if systemProxy { setSystemProxy(false) }; server.stop(); core.stopAndWait(); running = false; config.proxyEnabled = false; save() }
+    func stop() { if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }; server.stop(); core.stopAndWait(); running = false; config.proxyEnabled = false; resetNetworkPanel(); save() }
     func toggleServer() { running ? stop() : start() }
     func save() { store.save(config) }
 
     func addSubscription(name: String, url: String) async {
+        guard config.subscriptions.isEmpty else {
+            notice = "当前版本仅支持一个活动订阅，请先删除现有订阅"
+            return
+        }
         let profile = SubscriptionProfile(id: UUID().uuidString, name: name.isEmpty ? "我的订阅" : name, url: url, updatedAt: nil, nodeIDs: [], lastError: nil)
         config.subscriptions.append(profile); save(); await refreshSubscription(profile.id)
     }
     func refreshSubscription(_ id: String) async {
-        guard let index = config.subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        guard !busy else { return }
+        guard !testingAll, testingNodeIDs.isEmpty else { notice = "请等待节点测速完成后再更新订阅"; return }
+        guard let profile = config.subscriptions.first(where: { $0.id == id }) else { return }
+        let cache = providerCacheURL(id)
+        let oldDocument = try? Data(contentsOf: cache)
+        let oldNodes = config.nodes.filter { $0.sourceID == id }
+        let oldSelectedNodeID = config.selectedNodeID
         busy = true
+        defer { busy = false }
+        var changed = false
         do {
-            let result = try await subscriptionService.fetchResult(url: config.subscriptions[index].url, sourceID: id)
-            let nodes = result.nodes
-            try result.document.write(to: providerCacheURL(id), options: .atomic)
+            let result = try await subscriptionService.fetchResult(url: profile.url, sourceID: id)
+            var nodes = result.nodes
+            let priorNodeState = Dictionary(oldNodes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for index in nodes.indices {
+                nodes[index].lastLatency = priorNodeState[nodes[index].id]?.lastLatency
+                nodes[index].lastError = priorNodeState[nodes[index].id]?.lastError
+            }
+            guard config.subscriptions.contains(where: { $0.id == id }) else { return }
+            changed = oldDocument != result.document
+            if !core.isRunning {
+                try await validateProviderDocument(result.document, subscriptionID: id)
+            }
+            try result.document.write(to: cache, options: .atomic)
+            guard let index = config.subscriptions.firstIndex(where: { $0.id == id }) else { return }
             config.nodes.removeAll { $0.sourceID == id }; config.nodes.append(contentsOf: nodes)
             config.subscriptions[index].nodeIDs = nodes.map(\.id); config.subscriptions[index].updatedAt = Date(); config.subscriptions[index].lastError = nil
-            if config.selectedNodeID == nil { config.selectedNodeID = nodes.first(where: \.supported)?.id }
+            if !nodes.contains(where: { $0.id == config.selectedNodeID && $0.supported }) {
+                config.selectedNodeID = nodes.first(where: \.supported)?.id
+            }
             notice = "已更新 \(nodes.count) 个节点"
-        } catch { config.subscriptions[index].lastError = error.localizedDescription; notice = error.localizedDescription }
-        busy = false; save()
-        if running, config.mode != .direct, let subscription = config.subscriptions.first {
+        } catch {
+            if let index = config.subscriptions.firstIndex(where: { $0.id == id }) { config.subscriptions[index].lastError = error.localizedDescription }
+            notice = error.localizedDescription
+        }
+        save()
+        if changed, running, config.mode != .direct, config.subscriptions.first?.id == id, let subscription = config.subscriptions.first {
             do {
                 try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode, forceReload: true)
-                if systemProxy { refreshSystemProxyEndpoint() }
+                resetNetworkPanel()
+                if systemProxy, !refreshSystemProxyEndpoint() {
+                    failSafeAfterCoreFailure("订阅已更新，但系统代理端口更新失败")
+                }
             }
-            catch { notice = "核心重载失败：\(error.localizedDescription)" }
+            catch {
+                let rejectedReason = error.localizedDescription
+                guard let oldDocument else {
+                    failSafeAfterCoreFailure("核心重载失败：\(rejectedReason)")
+                    return
+                }
+                do {
+                    try oldDocument.write(to: cache, options: .atomic)
+                    config.nodes.removeAll { $0.sourceID == id }
+                    config.nodes.append(contentsOf: oldNodes)
+                    if let index = config.subscriptions.firstIndex(where: { $0.id == id }) {
+                        config.subscriptions[index] = profile
+                        config.subscriptions[index].lastError = "新订阅无法加载：\(rejectedReason)"
+                    }
+                    config.selectedNodeID = oldSelectedNodeID
+                    let oldSelectedName = oldNodes.first { $0.id == oldSelectedNodeID }?.name
+                    try core.start(providerFile: cache, selectedNode: oldSelectedName, mode: config.mode, forceReload: true)
+                    running = true
+                    resetNetworkPanel()
+                    if systemProxy, !refreshSystemProxyEndpoint() {
+                        throw TunnelError.connect("恢复旧订阅后，系统代理端口更新失败")
+                    }
+                    save()
+                    notice = "新订阅无法加载，已恢复上一次可用配置：\(rejectedReason)"
+                } catch {
+                    failSafeAfterCoreFailure("新订阅与旧配置均无法启动：\(error.localizedDescription)")
+                }
+            }
         }
     }
-    func removeSubscription(_ id: String) { config.nodes.removeAll { $0.sourceID == id }; config.subscriptions.removeAll { $0.id == id }; if !config.nodes.contains(where: { $0.id == config.selectedNodeID }) { config.selectedNodeID = nil }; save() }
+    func removeSubscription(_ id: String) {
+        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再删除订阅"; return }
+        let removingActive = config.subscriptions.first?.id == id && running && config.mode != .direct
+        if removingActive { stop() }
+        config.nodes.removeAll { $0.sourceID == id }
+        config.subscriptions.removeAll { $0.id == id }
+        try? FileManager.default.removeItem(at: providerCacheURL(id))
+        if !config.nodes.contains(where: { $0.id == config.selectedNodeID }) { config.selectedNodeID = config.nodes.first(where: \.supported)?.id }
+        save()
+    }
 
     func testNode(_ id: String) async {
+        guard !busy, !testingAll, testingNodeIDs.isEmpty else { return }
         guard let node = config.nodes.first(where: { $0.id == id }) else { return }
         guard node.supported else { return }
-        if !core.isRunning, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode) }
+        guard let subscription = config.subscriptions.first, subscription.id == node.sourceID else {
+            notice = "该节点不属于当前活动订阅"
+            return
+        }
+        testingNodeIDs.insert(id)
+        defer { testingNodeIDs.remove(id) }
+        let temporaryCore = !core.isRunning && (!running || config.mode == .direct)
+        if !core.isRunning {
+            do {
+                try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: .rule)
+                if running && config.mode != .direct && systemProxy, !refreshSystemProxyEndpoint() {
+                    failSafeAfterCoreFailure("节点测速启动核心后，系统代理端口更新失败")
+                    return
+                }
+            }
             catch { notice = error.localizedDescription; return }
         }
-        let started = Date(); var latency: Int?; var failure: String?
+        defer { if temporaryCore { core.stopAndWait() } }
+        var latency: Int?; var failure: String?
         do {
-            if core.isRunning {
-                latency = try await core.latency(node: node.name, target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
-            } else {
-                let tunnel: Tunnel = node.type == "ss" ? try ShadowsocksTunnel(node: node, destinationHost: "www.apple.com", destinationPort: 443) : try SocketFD.connect(host: node.host, port: node.port)
-                tunnel.close(); latency = Int(Date().timeIntervalSince(started) * 1000)
-            }
+            guard core.isRunning else { throw TunnelError.connect("代理核心已停止，无法执行真实测速") }
+            latency = try await core.latency(node: node.name, target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
         } catch { failure = error.localizedDescription }
         guard let index = config.nodes.firstIndex(where: { $0.id == id }) else { return }
         config.nodes[index].lastLatency = latency; config.nodes[index].lastError = failure
@@ -185,7 +314,9 @@ final class AppModel: ObservableObject {
     }
 
     func selectNode(_ id: String) async {
+        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再切换节点"; return }
         guard let node = config.nodes.first(where: { $0.id == id }), node.supported else { return }
+        guard config.subscriptions.first?.id == node.sourceID else { notice = "该节点不属于当前活动订阅"; return }
         if core.isRunning {
             do {
                 try await core.select(node: node.name)
@@ -199,12 +330,23 @@ final class AppModel: ObservableObject {
 
     func testAllNodes(ids: [String]? = nil) async {
         guard !testingAll else { return }
-        if !core.isRunning, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode) }
+        guard !busy, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成"; return }
+        guard let subscription = config.subscriptions.first else { notice = "请先添加并更新订阅"; return }
+        let temporaryCore = !core.isRunning && (!running || config.mode == .direct)
+        if !core.isRunning {
+            do {
+                try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: .rule)
+                if running && config.mode != .direct && systemProxy, !refreshSystemProxyEndpoint() {
+                    failSafeAfterCoreFailure("一键测速启动核心后，系统代理端口更新失败")
+                    return
+                }
+            }
             catch { notice = error.localizedDescription; return }
         }
+        defer { if temporaryCore { core.stopAndWait() } }
         testingAll = true
-        let targets = config.nodes.filter { $0.supported && (ids == nil || ids!.contains($0.id)) }
+        let requestedIDs = ids.map(Set.init)
+        let targets = config.nodes.filter { $0.sourceID == subscription.id && $0.supported && (requestedIDs?.contains($0.id) ?? true) }
         guard !targets.isEmpty else { testingAll = false; notice = "没有可测速的节点"; return }
         do {
             let latencies = try await core.groupLatencies(target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
@@ -229,51 +371,125 @@ final class AppModel: ObservableObject {
 
     func setSystemProxy(_ enabled: Bool) {
         if enabled && !running {
+            let subscriptionCacheMissing = config.mode != .direct && config.subscriptions.first.map {
+                !FileManager.default.fileExists(atPath: providerCacheURL($0.id).path)
+            } == true
+            config.systemProxyEnabled = true
+            config.proxyEnabled = true
+            save()
             start()
             guard running else {
                 systemProxy = false
-                config.systemProxyEnabled = false
-                save()
+                if !subscriptionCacheMissing {
+                    config.systemProxyEnabled = false
+                    config.proxyEnabled = false
+                    save()
+                }
                 return
             }
         }
         let services = Self.networkServices()
         guard !services.isEmpty else { notice = "没有找到可配置的网络服务"; return }
+        if !enabled, config.systemProxyBackups.isEmpty {
+            // We have no evidence that Zhilian changed macOS. Never turn off a
+            // proxy owned by another app merely because the UI toggle is false.
+            systemProxy = false
+            config.systemProxyEnabled = false
+            save()
+            return
+        }
         var failures: [String] = []
         if enabled {
+            let hadBackups = !config.systemProxyBackups.isEmpty
+            var activationAttempted = false
             // Preserve the original macOS proxy exactly once.  Reapplying after
             // a core restart must not overwrite it with Zhilian's old port.
-            if !systemProxy {
+            if config.systemProxyBackups.isEmpty {
                 config.systemProxyBackups = services.compactMap { service in
                     guard let web = Self.proxyEndpoint(service: service, secure: false),
-                          let secure = Self.proxyEndpoint(service: service, secure: true) else {
+                          let secure = Self.proxyEndpoint(service: service, secure: true),
+                          let socks = Self.socksProxyEndpoint(service: service) else {
                         failures.append(service)
                         return nil
                     }
-                    return .init(service: service, web: web, secureWeb: secure)
+                    return .init(service: service, web: web, secureWeb: secure, socks: socks)
+                }
+            } else {
+                // Older versions never changed SOCKS. Capture its still-original
+                // value before the first upgraded activation.
+                for index in config.systemProxyBackups.indices where config.systemProxyBackups[index].socks == nil {
+                    guard let socks = Self.socksProxyEndpoint(service: config.systemProxyBackups[index].service) else {
+                        failures.append(config.systemProxyBackups[index].service)
+                        continue
+                    }
+                    config.systemProxyBackups[index].socks = socks
+                }
+                // A network service may have been added while Zhilian was
+                // running. Back it up before changing it as well.
+                let knownServices = Set(config.systemProxyBackups.map(\.service))
+                for service in services where !knownServices.contains(service) {
+                    guard let web = Self.proxyEndpoint(service: service, secure: false),
+                          let secure = Self.proxyEndpoint(service: service, secure: true),
+                          let socks = Self.socksProxyEndpoint(service: service) else {
+                        failures.append(service)
+                        continue
+                    }
+                    config.systemProxyBackups.append(.init(service: service, web: web, secureWeb: secure, socks: socks))
                 }
             }
-            failures.append(contentsOf: applySystemProxy(services: services))
+            if failures.isEmpty {
+                activationAttempted = true
+                failures.append(contentsOf: applySystemProxy(services: services))
+            }
+            if !failures.isEmpty, activationAttempted {
+                // Roll back partial activation so one failed network service
+                // cannot leave macOS in a half-proxied state.
+                let backups = Dictionary(config.systemProxyBackups.map { ($0.service, $0) }, uniquingKeysWith: { first, _ in first })
+                var rollbackFailed = false
+                for service in services {
+                    let backup = backups[service]
+                    let web = Self.restoreProxy(service: service, endpoint: backup?.web, secure: false)
+                    let secure = Self.restoreProxy(service: service, endpoint: backup?.secureWeb, secure: true)
+                    let socks = backup?.socks.map { Self.restoreSocksProxy(service: service, endpoint: $0) } ?? true
+                    rollbackFailed = rollbackFailed || !web || !secure || !socks
+                }
+                if !rollbackFailed { config.systemProxyBackups = [] }
+            } else if !failures.isEmpty, !hadBackups {
+                // Nothing was changed, so discard an incomplete fresh backup
+                // instead of using it during a later restore.
+                config.systemProxyBackups = []
+            }
         } else {
-            let backups = Dictionary(uniqueKeysWithValues: config.systemProxyBackups.map { ($0.service, $0) })
-            for service in services {
-                let backup = backups[service]
-                let webRestored = Self.restoreProxy(service: service, endpoint: backup?.web, secure: false)
-                let secureRestored = Self.restoreProxy(service: service, endpoint: backup?.secureWeb, secure: true)
-                if !webRestored || !secureRestored {
+            let backups = Dictionary(config.systemProxyBackups.map { ($0.service, $0) }, uniquingKeysWith: { first, _ in first })
+            var unresolvedBackups = config.systemProxyBackups.filter { !services.contains($0.service) }
+            for (service, backup) in backups {
+                guard services.contains(service) else { continue }
+                let webRestored = Self.restoreProxy(service: service, endpoint: backup.web, secure: false)
+                let secureRestored = Self.restoreProxy(service: service, endpoint: backup.secureWeb, secure: true)
+                let socksRestored = backup.socks.map { Self.restoreSocksProxy(service: service, endpoint: $0) } ?? true
+                if !webRestored || !secureRestored || !socksRestored {
                     failures.append(service)
+                    unresolvedBackups.append(backup)
                 }
             }
-            config.systemProxyBackups = []
+            config.systemProxyBackups = unresolvedBackups
         }
         systemProxy = enabled && failures.isEmpty
         config.systemProxyEnabled = systemProxy
+        if systemProxy {
+            lastAppliedSystemProxyPort = systemProxyPort
+            proxyOwnershipGraceUntil = Date().addingTimeInterval(3)
+        } else {
+            lastAppliedSystemProxyPort = nil
+        }
         save()
         if !failures.isEmpty { notice = "系统代理未能应用到：\(failures.sorted().joined(separator: "、"))" }
     }
 
     func changeMode(_ mode: ProxyMode) {
         guard config.mode != mode else { return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再切换模式"; return }
+        let previousMode = config.mode
         config.mode = mode
         save()
         guard running else { return }
@@ -281,6 +497,7 @@ final class AppModel: ObservableObject {
             core.stopAndWait()
             server.stop()
             running = false
+            resetNetworkPanel()
             start()
         } else {
             server.stop()
@@ -290,19 +507,43 @@ final class AppModel: ObservableObject {
                 return
             }
             do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: mode, forceReload: true) }
-            catch { notice = "切换模式失败：\(error.localizedDescription)"; return }
-            if systemProxy { refreshSystemProxyEndpoint() }
+            catch {
+                let switchError = error.localizedDescription
+                config.mode = previousMode
+                if previousMode == .direct {
+                    running = false
+                    start()
+                    notice = running ? "模式切换失败，已恢复直连模式：\(switchError)" : "模式切换失败且直连模式未能恢复：\(switchError)"
+                } else {
+                    do {
+                        try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: previousMode, forceReload: true)
+                        running = true
+                        if systemProxy, !refreshSystemProxyEndpoint() {
+                            throw TunnelError.connect("恢复原模式后，系统代理端口更新失败")
+                        }
+                        save()
+                        notice = "模式切换失败，已恢复原模式：\(switchError)"
+                    } catch {
+                        failSafeAfterCoreFailure("模式切换及恢复均失败：\(error.localizedDescription)")
+                    }
+                }
+                return
+            }
+            resetNetworkPanel()
+            if systemProxy, !refreshSystemProxyEndpoint() {
+                failSafeAfterCoreFailure("模式已切换，但系统代理端口更新失败")
+            }
         }
     }
 
     /// Rebind an already-enabled macOS proxy after mihomo receives a new
     /// per-process mixed-port.  This avoids a running UI with a stale system
     /// proxy pointing at a core that has already exited.
-    private func refreshSystemProxyEndpoint() {
-        let services = Self.networkServices()
-        guard !services.isEmpty else { return }
-        let failures = applySystemProxy(services: services)
-        if !failures.isEmpty { notice = "系统代理未能更新到当前核心：\(failures.sorted().joined(separator: "、"))" }
+    @discardableResult
+    private func refreshSystemProxyEndpoint() -> Bool {
+        guard running else { return false }
+        setSystemProxy(true)
+        return systemProxy
     }
 
     private func applySystemProxy(services: [String]) -> [String] {
@@ -310,18 +551,113 @@ final class AppModel: ObservableObject {
         for service in services {
             let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
             let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
+            let socks: (success: Bool, output: String)
+            if config.mode == .direct {
+                socks = Self.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "off"])
+            } else {
+                socks = Self.run("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, "127.0.0.1", "\(systemProxyPort)"])
+            }
             let expected = systemProxyPort
             let appliedWeb = Self.proxyEndpoint(service: service, secure: false)
             let appliedSecure = Self.proxyEndpoint(service: service, secure: true)
+            let appliedSocks = Self.socksProxyEndpoint(service: service)
             let verified = appliedWeb?.enabled == true && appliedWeb?.server == "127.0.0.1" && appliedWeb?.port == expected
                 && appliedSecure?.enabled == true && appliedSecure?.server == "127.0.0.1" && appliedSecure?.port == expected
-            if !web.success || !secure.success || !verified { failures.append(service) }
+            let socksVerified: Bool
+            if config.mode == .direct {
+                socksVerified = appliedSocks?.enabled == false
+            } else {
+                socksVerified = appliedSocks?.enabled == true && appliedSocks?.server == "127.0.0.1" && appliedSocks?.port == expected
+            }
+            if !web.success || !secure.success || !socks.success || !verified || !socksVerified { failures.append(service) }
         }
         return failures
     }
 
-    private func sampleTraffic() {
-        // This is the only point where network traffic updates SwiftUI state.
+    private func updateNetworkPanel() async {
+        guard running else { return }
+        if systemProxy {
+            proxyOwnershipCheckTicks += 1
+            if proxyOwnershipCheckTicks >= 5, Date() >= proxyOwnershipGraceUntil {
+                proxyOwnershipCheckTicks = 0
+                if let expectedPort = lastAppliedSystemProxyPort,
+                   !effectiveSystemProxyMatches(expectedPort: expectedPort) {
+                    // Another app or the user changed macOS after Zhilian took
+                    // ownership. Restore only protocol entries that still point
+                    // at our old port, without overwriting the newer choice.
+                    let unresolved = relinquishSystemProxy(expectedPort: expectedPort)
+                    systemProxy = false
+                    lastAppliedSystemProxyPort = nil
+                    config.systemProxyEnabled = false
+                    config.systemProxyBackups = unresolved
+                    save()
+                    notice = "系统代理已被其他设置接管；智连核心仍在运行，但不会覆盖新的代理配置"
+                }
+            }
+        } else {
+            proxyOwnershipCheckTicks = 0
+        }
+        if config.mode != .direct {
+            guard core.isRunning else {
+                coreSnapshotFailures += 1
+                if coreSnapshotFailures >= 3 {
+                    if !coreRecoveryAttempted {
+                        coreRecoveryAttempted = true
+                        if recoverCore() { return }
+                    }
+                    failSafeAfterCoreFailure("代理核心意外停止，系统代理已恢复")
+                }
+                return
+            }
+            guard !pollingCore else { return }
+            pollingCore = true
+            defer { pollingCore = false }
+            let generation = networkGeneration
+            do {
+                let snapshot = try await core.connectionSnapshot()
+                guard running, config.mode != .direct, core.isRunning, generation == networkGeneration else { return }
+                apply(snapshot)
+                coreSnapshotFailures = 0
+                coreRecoveryAttempted = false
+            } catch {
+                coreSnapshotFailures += 1
+                // A request can race with a subscription reload. Only restart
+                // after repeated failures, and only once for each outage.
+                if coreSnapshotFailures >= 5 {
+                    if !coreRecoveryAttempted {
+                        coreRecoveryAttempted = true
+                        if recoverCore() { return }
+                    }
+                    failSafeAfterCoreFailure("代理核心或连接面板无响应：\(error.localizedDescription)")
+                }
+            }
+            return
+        }
+        sampleLocalProxyTraffic()
+    }
+
+    private func apply(_ snapshot: CoreConnectionSnapshot) {
+        let uploadDelta = max(0, snapshot.uploadTotal - totalUpload)
+        let downloadDelta = max(0, snapshot.downloadTotal - totalDownload)
+        totalUpload = snapshot.uploadTotal
+        totalDownload = snapshot.downloadTotal
+        coreMemory = snapshot.memory
+        let activeIDs = Set(snapshot.connections.map(\.id))
+        var history = connections.filter { !activeIDs.contains($0.id) }
+        for index in history.indices where history[index].endedAt == nil {
+            history[index].endedAt = Date()
+            history[index].status = "完成"
+        }
+        let combined = snapshot.connections + history
+        connections = Array(combined.sorted { $0.startedAt > $1.startedAt }.prefix(300))
+        samples.append(.init(upload: uploadDelta, download: downloadDelta))
+        if samples.count > 60 { samples.removeFirst() }
+        previousUpload = totalUpload
+        previousDownload = totalDownload
+    }
+
+    private func sampleLocalProxyTraffic() {
+        // Direct mode still uses the Swift inspection proxy.
         for (id, delta) in trafficAccumulator.drain() {
             totalUpload += delta.upload
             totalDownload += delta.download
@@ -336,10 +672,116 @@ final class AppModel: ObservableObject {
         if samples.count > 60 { samples.removeFirst() }
     }
 
+    private func resetNetworkPanel() {
+        _ = trafficAccumulator.drain()
+        connections = []
+        samples = []
+        totalUpload = 0
+        totalDownload = 0
+        coreMemory = 0
+        previousUpload = 0
+        previousDownload = 0
+        coreSnapshotFailures = 0
+        coreRecoveryAttempted = false
+        networkGeneration &+= 1
+    }
+
+    private func effectiveSystemProxyMatches(expectedPort: Int) -> Bool {
+        guard let proxies = SCDynamicStoreCopyProxies(nil) as? [String: Any] else { return false }
+        func enabled(_ key: CFString) -> Bool {
+            (proxies[key as String] as? NSNumber)?.boolValue == true
+        }
+        func host(_ key: CFString) -> String {
+            proxies[key as String] as? String ?? ""
+        }
+        func port(_ key: CFString) -> Int {
+            (proxies[key as String] as? NSNumber)?.intValue ?? 0
+        }
+        let webMatches = enabled(kSCPropNetProxiesHTTPEnable)
+            && host(kSCPropNetProxiesHTTPProxy) == "127.0.0.1"
+            && port(kSCPropNetProxiesHTTPPort) == expectedPort
+        let secureMatches = enabled(kSCPropNetProxiesHTTPSEnable)
+            && host(kSCPropNetProxiesHTTPSProxy) == "127.0.0.1"
+            && port(kSCPropNetProxiesHTTPSPort) == expectedPort
+        let socksMatches: Bool
+        if config.mode == .direct {
+            socksMatches = !enabled(kSCPropNetProxiesSOCKSEnable)
+        } else {
+            socksMatches = enabled(kSCPropNetProxiesSOCKSEnable)
+                && host(kSCPropNetProxiesSOCKSProxy) == "127.0.0.1"
+                && port(kSCPropNetProxiesSOCKSPort) == expectedPort
+        }
+        return webMatches && secureMatches && socksMatches
+    }
+
+    private func relinquishSystemProxy(expectedPort: Int) -> [SystemProxyBackup] {
+        let services = Self.networkServices()
+        var unresolved: [SystemProxyBackup] = []
+        func owned(_ endpoint: SystemProxyEndpoint?) -> Bool {
+            endpoint?.enabled == true && endpoint?.server == "127.0.0.1" && endpoint?.port == expectedPort
+        }
+        for backup in config.systemProxyBackups {
+            guard services.contains(backup.service),
+                  let web = Self.proxyEndpoint(service: backup.service, secure: false),
+                  let secure = Self.proxyEndpoint(service: backup.service, secure: true),
+                  let socks = Self.socksProxyEndpoint(service: backup.service) else {
+                unresolved.append(backup)
+                continue
+            }
+            var restored = true
+            if owned(web) {
+                restored = Self.restoreProxy(service: backup.service, endpoint: backup.web, secure: false) && restored
+            }
+            if owned(secure) {
+                restored = Self.restoreProxy(service: backup.service, endpoint: backup.secureWeb, secure: true) && restored
+            }
+            let socksOwned = config.mode == .direct ? !socks.enabled : owned(socks)
+            if socksOwned, let originalSocks = backup.socks {
+                restored = Self.restoreSocksProxy(service: backup.service, endpoint: originalSocks) && restored
+            }
+            if !restored { unresolved.append(backup) }
+        }
+        return unresolved
+    }
+
+    private func recoverCore() -> Bool {
+        guard config.mode != .direct,
+              let subscription = config.subscriptions.first,
+              FileManager.default.fileExists(atPath: providerCacheURL(subscription.id).path) else { return false }
+        do {
+            try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name,
+                           mode: config.mode, forceReload: true)
+            resetNetworkPanel()
+            coreRecoveryAttempted = true
+            if systemProxy {
+                guard refreshSystemProxyEndpoint(), systemProxy else { return false }
+            }
+            notice = "代理核心已自动恢复"
+            return true
+        } catch {
+            notice = "代理核心自动恢复失败：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func failSafeAfterCoreFailure(_ message: String) {
+        let enableOnNextLaunch = config.systemProxyEnabled
+        if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
+        config.systemProxyEnabled = enableOnNextLaunch
+        server.stop()
+        core.stopAndWait()
+        running = false
+        resetNetworkPanel()
+        save()
+        notice = message
+    }
+
     /// AppKit calls this on Quit.  Unlike the visible Stop button, process
     /// cleanup must not silently change the user's "start on launch" choice.
     private func shutdownForTermination() {
-        if systemProxy { setSystemProxy(false) }
+        let enableOnNextLaunch = config.systemProxyEnabled
+        if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
+        config.systemProxyEnabled = enableOnNextLaunch
         server.stop()
         core.stopAndWait()
         running = false
@@ -349,6 +791,17 @@ final class AppModel: ObservableObject {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ZhilianNative/Providers", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory.appendingPathComponent(subscriptionID + ".yaml")
+    }
+    private func validateProviderDocument(_ document: Data, subscriptionID: String) async throws {
+        let cache = providerCacheURL(subscriptionID)
+        let candidate = cache.deletingLastPathComponent().appendingPathComponent(".candidate-\(UUID().uuidString).yaml")
+        try document.write(to: candidate, options: .atomic)
+        defer {
+            core.stopAndWait()
+            try? FileManager.default.removeItem(at: candidate)
+        }
+        try core.start(providerFile: candidate, selectedNode: nil, mode: config.mode == .direct ? .rule : config.mode)
+        try await core.validateProviderLoaded()
     }
     private static func networkServices() -> [String] { run("/usr/sbin/networksetup", ["-listallnetworkservices"]).output.split(separator: "\n").dropFirst().map(String.init).filter { !$0.hasPrefix("*") } }
     private static func proxyEndpoint(service: String, secure: Bool) -> SystemProxyEndpoint? {
@@ -362,13 +815,38 @@ final class AppModel: ObservableObject {
         guard let state = values["Enabled"] else { return nil }
         return .init(enabled: state.caseInsensitiveCompare("Yes") == .orderedSame, server: values["Server"] ?? "", port: Int(values["Port"] ?? "") ?? 0)
     }
+    private static func socksProxyEndpoint(service: String) -> SystemProxyEndpoint? {
+        let result = run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
+        guard result.success else { return nil }
+        var values: [String: String] = [:]
+        for line in result.output.split(separator: "\n") {
+            let pair = line.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+            if pair.count == 2 { values[pair[0]] = pair[1] }
+        }
+        guard let state = values["Enabled"] else { return nil }
+        return .init(enabled: state.caseInsensitiveCompare("Yes") == .orderedSame,
+                     server: values["Server"] ?? "", port: Int(values["Port"] ?? "") ?? 0)
+    }
     private static func restoreProxy(service: String, endpoint: SystemProxyEndpoint?, secure: Bool) -> Bool {
         let stateFlag = secure ? "-setsecurewebproxystate" : "-setwebproxystate"
         let setFlag = secure ? "-setsecurewebproxy" : "-setwebproxy"
-        guard let endpoint, endpoint.enabled, !endpoint.server.isEmpty, endpoint.port > 0 else {
+        guard let endpoint else {
             return run("/usr/sbin/networksetup", [stateFlag, service, "off"]).success
         }
-        return run("/usr/sbin/networksetup", [setFlag, service, endpoint.server, "\(endpoint.port)"]).success
+        var success = true
+        if !endpoint.server.isEmpty, endpoint.port > 0 {
+            success = run("/usr/sbin/networksetup", [setFlag, service, endpoint.server, "\(endpoint.port)"]).success
+        }
+        let state = run("/usr/sbin/networksetup", [stateFlag, service, endpoint.enabled ? "on" : "off"]).success
+        return success && state
+    }
+    private static func restoreSocksProxy(service: String, endpoint: SystemProxyEndpoint) -> Bool {
+        var success = true
+        if !endpoint.server.isEmpty, endpoint.port > 0 {
+            success = run("/usr/sbin/networksetup", ["-setsocksfirewallproxy", service, endpoint.server, "\(endpoint.port)"]).success
+        }
+        let state = run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, endpoint.enabled ? "on" : "off"]).success
+        return success && state
     }
     private static func run(_ path: String, _ args: [String]) -> (success: Bool, output: String) {
         let process = Process(); let output = Pipe(); let error = Pipe()

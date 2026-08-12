@@ -87,6 +87,9 @@ struct SystemProxyBackup: Codable, Hashable {
     var service: String
     var web: SystemProxyEndpoint
     var secureWeb: SystemProxyEndpoint
+    /// Optional for backward compatibility with settings written before
+    /// Zhilian started managing the macOS SOCKS proxy as well.
+    var socks: SystemProxyEndpoint?
 }
 
 struct RoutingRule: Codable, Identifiable, Hashable {
@@ -99,7 +102,7 @@ struct RoutingRule: Codable, Identifiable, Hashable {
     var builtIn: Bool
 }
 
-struct ConnectionRecord: Identifiable, Hashable {
+struct ConnectionRecord: Identifiable, Hashable, Sendable {
     var id = UUID()
     var host: String
     var port: Int
@@ -114,7 +117,16 @@ struct ConnectionRecord: Identifiable, Hashable {
     var status = "活动"
 }
 
-struct TrafficSample: Identifiable, Hashable {
+/// A point-in-time view returned by Mihomo's authenticated controller API.
+/// Keeping it independent of SwiftUI makes the parsing straightforward to test.
+struct CoreConnectionSnapshot: Sendable {
+    var uploadTotal: Int64
+    var downloadTotal: Int64
+    var memory: Int64
+    var connections: [ConnectionRecord]
+}
+
+struct TrafficSample: Identifiable, Hashable, Sendable {
     var id = UUID()
     var date = Date()
     var upload: Int64

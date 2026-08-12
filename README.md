@@ -2,7 +2,7 @@
 
 智连是一款面向 Apple Silicon Mac 的原生 macOS 智能代理客户端。当前正式实现位于 [`native/`](native/)，使用 SwiftUI、Foundation 和内嵌 Mihomo 核心，提供本地 HTTP 代理、订阅管理、节点选择/测速、连接面板与国内/境外自动分流。
 
-> 版本：0.5.2 · 最低系统：macOS 13 · 架构：Apple Silicon（arm64）
+> 版本：0.6.0 · 最低系统：macOS 13 · 架构：Apple Silicon（arm64）
 
 ## 功能
 
@@ -10,7 +10,7 @@
 - **协议支持**：AnyTLS、Shadowsocks、HTTP、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、WireGuard（实际隧道由 Mihomo 支持）。
 - **节点管理**：按地区和协议分类，选择节点，单节点测速和一键组测速。
 - **智能分流**：先按域名类别识别，再按目标服务器 IP 判断中国大陆/境外；国内默认直连，境外默认经代理。
-- **网络面板**：实时流量、连接历史、规则命中和出口节点。
+- **网络面板**：读取 Mihomo 的真实连接快照，显示实时流量、连接历史、规则命中和出口节点。
 - **本机安全**：本地 HTTP 代理、SOCKS 核心和控制接口均绑定 `127.0.0.1`。
 
 ## 构建
@@ -24,8 +24,8 @@ cd native
 
 构建会生成以下文件到仓库上级目录的 `outputs/`：
 
-- `智连-0.5.2.dmg`
-- `智连-0.5.2-macOS.zip`
+- `智连-0.6.0.dmg`
+- `智连-0.6.0-macOS.zip`
 
 脚本会临时进行 ad-hoc 签名，适合本机测试。公开发布前请使用 Apple Developer ID 签名并完成 Apple 公证。
 
@@ -54,6 +54,6 @@ packaging/       早期原型的打包脚本
 
 ## 重要说明
 
-- 本项目默认通过 macOS HTTP/HTTPS 系统代理工作，不是 TUN/Network Extension 实现；不遵循系统代理的应用、UDP/QUIC 流量不在当前版本的接管范围内。
+- 本项目默认接管 macOS HTTP、HTTPS 与 SOCKS 系统代理，不是 TUN/Network Extension 实现；完全不遵循系统代理的应用、UDP/QUIC 流量不在当前版本的接管范围内。
 - 请勿提交订阅链接、令牌、`~/Library/Application Support/ZhilianNative/` 中的运行数据或任何真实配置文件。
 - 内嵌 Mihomo 二进制的许可文本位于 [`native/Resources/Core/LICENSE-MIHOMO.txt`](native/Resources/Core/LICENSE-MIHOMO.txt)。

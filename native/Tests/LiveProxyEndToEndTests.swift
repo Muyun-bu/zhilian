@@ -37,15 +37,15 @@ struct LiveProxyEndToEndTests {
         throw firstFailure ?? TunnelError.connect("所有已测速节点均无法通过 SOCKS 建立 HTTPS 隧道")
     }
 
-    private static func connectThrough(proxyPort: Int, host: String, port: Int) throws {
+    private static func connectThrough(proxyPort: Int, host: String, port destinationPort: Int) throws {
         let proxy = ProxyServer(router: RoutingEngine(database: IPDatabase(resourceURL: URL(fileURLWithPath: CommandLine.arguments[3]))))
         proxy.context = { .init(mode: .global, rules: RoutingRule.builtIns, node: nil, coreSocksPort: proxyPort) }
-        let port = try start(proxy: proxy)
+        let listenerPort = try start(proxy: proxy)
         defer { proxy.stop() }
 
-        let client = try SocketFD.connect(host: "127.0.0.1", port: port, timeout: 15)
+        let client = try SocketFD.connect(host: "127.0.0.1", port: listenerPort, timeout: 15)
         defer { client.close() }
-        try client.write(Data("CONNECT \(host):\(port) HTTP/1.1\r\nHost: \(host):\(port)\r\nProxy-Connection: keep-alive\r\n\r\n".utf8))
+        try client.write(Data("CONNECT \(host):\(destinationPort) HTTP/1.1\r\nHost: \(host):\(destinationPort)\r\nProxy-Connection: keep-alive\r\n\r\n".utf8))
         let response = try client.read(max: 4096)
         let text = String(data: response, encoding: .utf8) ?? ""
         guard text.hasPrefix("HTTP/") else {

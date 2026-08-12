@@ -87,6 +87,8 @@ private struct ProxyPowerButton: View {
 
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
+    private var currentUploadRate: Int64 { model.samples.last?.upload ?? 0 }
+    private var currentDownloadRate: Int64 { model.samples.last?.download ?? 0 }
     var body: some View {
         ScrollView { VStack(alignment: .leading, spacing: 22) {
             Header(title: "网络概览", subtitle: "实时查看流量、连接与自动分流状态")
@@ -98,11 +100,11 @@ struct DashboardView: View {
             }
             LazyVGrid(columns: [.init(.flexible()), .init(.flexible()), .init(.flexible()), .init(.flexible())], spacing: 14) {
                 StatCard(title: "代理状态", value: model.running ? "已运行" : "已停止", icon: "bolt.shield.fill", color: model.running ? .green : .gray)
-                StatCard(title: "上传流量", value: bytes(model.totalUpload), icon: "arrow.up", color: .orange)
-                StatCard(title: "下载流量", value: bytes(model.totalDownload), icon: "arrow.down", color: .blue)
+                StatCard(title: "上传", value: "\(bytes(model.totalUpload)) · \(bytes(currentUploadRate))/s", icon: "arrow.up", color: .orange)
+                StatCard(title: "下载", value: "\(bytes(model.totalDownload)) · \(bytes(currentDownloadRate))/s", icon: "arrow.down", color: .blue)
                 StatCard(title: "当前连接", value: "\(model.connections.filter { $0.endedAt == nil }.count)", icon: "network", color: .purple)
             }
-            VStack(alignment: .leading, spacing: 12) { Text("最近 60 秒流量").font(.headline); TrafficChart(samples: model.samples).frame(height: 190) }.padding(18).background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.quaternary))
+            VStack(alignment: .leading, spacing: 12) { HStack { Text("最近 60 秒流量").font(.headline); Spacer(); if model.running && model.config.mode != .direct && model.coreMemory > 0 { Text("核心内存 \(bytes(model.coreMemory))").font(.caption).foregroundStyle(.secondary) } }; TrafficChart(samples: model.samples).frame(height: 190) }.padding(18).background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 16)).overlay(RoundedRectangle(cornerRadius: 16).stroke(.quaternary))
             HStack(spacing: 14) {
                 VStack(alignment: .leading, spacing: 12) { Text("当前节点").font(.headline); if let node = model.selectedNode { Text(node.name).font(.title3.bold()); Text("\(node.type.uppercased()) · \(node.host):\(node.port)").foregroundStyle(.secondary) } else { Text("请添加订阅并选择节点").foregroundStyle(.secondary) } }.padding(18).frame(maxWidth: .infinity, minHeight: 120, alignment: .leading).background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
                 VStack(alignment: .leading, spacing: 10) { Text("分流策略").font(.headline); Label("域名与流量类别优先判断", systemImage: "1.circle.fill"); Label("目标服务器 IP 国内/境外复核", systemImage: "2.circle.fill"); Text("国内 DIRECT · 境外 PROXY").foregroundStyle(.secondary).font(.caption) }.padding(18).frame(maxWidth: .infinity, minHeight: 120, alignment: .leading).background(.background.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
@@ -127,20 +129,20 @@ struct NodesView: View {
     private var protocols: [String] { ["全部协议"] + Array(Set(model.config.nodes.map { $0.type.uppercased() })).sorted() }
     private var regions: [String] { ["全部地区"] + Array(Set(model.config.nodes.map(nodeRegion))).sorted() }
     private var filteredNodes: [ProxyNode] { model.config.nodes.filter { (protocolFilter == "全部协议" || $0.type.uppercased() == protocolFilter) && (regionFilter == "全部地区" || nodeRegion($0) == regionFilter) } }
-    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "代理节点", subtitle: "真实 HTTP 延迟 · \(model.config.latencyTestTarget.title) · \(model.config.latencyTimeoutMilliseconds / 1_000) 秒超时"); Button { Task { await model.testAllNodes() } } label: { Label(model.testingAll ? "测速中…" : "一键测速", systemImage: "speedometer") }.buttonStyle(.borderedProminent).controlSize(.large).disabled(model.testingAll || model.config.nodes.isEmpty) }
+    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "代理节点", subtitle: "真实 HTTP 延迟 · \(model.config.latencyTestTarget.title) · \(model.config.latencyTimeoutMilliseconds / 1_000) 秒超时"); Button { Task { await model.testAllNodes() } } label: { Label(model.testingAll ? "测速中…" : "一键测速", systemImage: "speedometer") }.buttonStyle(.borderedProminent).controlSize(.large).disabled(model.busy || model.testingAll || !model.testingNodeIDs.isEmpty || model.config.nodes.isEmpty) }
         HStack(spacing: 12) { Picker("地区", selection: $regionFilter) { ForEach(regions, id: \.self) { Text("\($0) (\(count(region: $0)))").tag($0) } }.frame(width: 190); Picker("协议", selection: $protocolFilter) { ForEach(protocols, id: \.self) { Text("\($0) (\(count(protocol: $0)))").tag($0) } }.frame(width: 210); Spacer(); Text("显示 \(filteredNodes.count) / \(model.config.nodes.count) 个节点").foregroundStyle(.secondary) }
         Table(filteredNodes) {
         TableColumn("节点") { node in VStack(alignment: .leading) { Text(node.name).fontWeight(.semibold); Text("\(node.host):\(node.port)").font(.caption.monospaced()).foregroundStyle(.secondary) } }
         TableColumn("地区") { Text(nodeRegion($0)) }.width(70)
         TableColumn("协议") { Text($0.type.uppercased()) }.width(75)
         TableColumn("延迟") { node in Text(node.lastLatency.map { "\($0) ms" } ?? (node.lastError == nil ? "未测试" : "失败")).foregroundStyle(node.lastLatency == nil ? Color.secondary : Color.green) }.width(90)
-        TableColumn("状态") { node in HStack { Button(model.config.selectedNodeID == node.id ? "已选择" : "选择") { Task { await model.selectNode(node.id) } }.disabled(!node.supported); Button("测速") { Task { await model.testNode(node.id) } } } }.width(150)
+        TableColumn("状态") { node in HStack { Button(model.config.selectedNodeID == node.id ? "已选择" : "选择") { Task { await model.selectNode(node.id) } }.disabled(!node.supported || model.busy || model.testingAll || !model.testingNodeIDs.isEmpty); Button(model.testingNodeIDs.contains(node.id) ? "测速中…" : "测速") { Task { await model.testNode(node.id) } }.disabled(!node.supported || model.busy || model.testingAll || !model.testingNodeIDs.isEmpty) } }.width(165)
     }.tableStyle(.inset(alternatesRowBackgrounds: true)) }.padding(28) }
 
     private func nodeRegion(_ node: ProxyNode) -> String {
         let value = node.name.lowercased()
         if ["剩余流量", "套餐到期", "到期时间"].contains(where: { node.name.contains($0) }) { return "账户信息" }
-        let mappings = [("香港", ["香港", "hong kong", "hk"]), ("台湾", ["台湾", "taiwan", "tw"]), ("新加坡", ["新加坡", "singapore", "sg"]), ("日本", ["日本", "japan", "jp"]), ("美国", ["美国", "united states", "usa", "us"]), ("韩国", ["韩国", "korea", "kr"]), ("英国", ["英国", "united kingdom", "uk"])]
+        let mappings = [("香港", ["香港", "hong kong", "hk"]), ("台湾", ["台湾", "taiwan", "tw"]), ("新加坡", ["新加坡", "singapore", "sg"]), ("日本", ["日本", "japan", "jp"]), ("美国", ["美国", "united states", "usa", "us"]), ("韩国", ["韩国", "korea", "kr"]), ("英国", ["英国", "united kingdom", "uk"]), ("德国", ["德国", "germany", "de"]), ("菲律宾", ["菲律宾", "philippines", "ph"]), ("加拿大", ["加拿大", "canada", "ca"]), ("澳大利亚", ["澳大利亚", "澳洲", "australia", "au"]), ("法国", ["法国", "france", "fr"]), ("印度", ["印度", "india", "in"]), ("荷兰", ["荷兰", "netherlands", "nl"])]
         return mappings.first(where: { $0.1.contains(where: { value.contains($0) }) })?.0 ?? "其他"
     }
     private func count(region: String) -> Int { region == "全部地区" ? model.config.nodes.count : model.config.nodes.filter { nodeRegion($0) == region }.count }
@@ -149,14 +151,14 @@ struct NodesView: View {
 
 struct SubscriptionsView: View {
     @EnvironmentObject var model: AppModel; @State private var showingAdd = false
-    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "订阅管理", subtitle: "订阅地址只保存在本机，不会上传"); Button("添加订阅", systemImage: "plus") { showingAdd = true }.buttonStyle(.borderedProminent) }
-        List { ForEach(model.config.subscriptions) { item in HStack(spacing: 14) { Image(systemName: item.lastError == nil ? "checkmark.circle.fill" : "exclamationmark.triangle.fill").foregroundStyle(item.lastError == nil ? .green : .orange); VStack(alignment: .leading) { Text(item.name).fontWeight(.semibold); Text(item.updatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "尚未更新").font(.caption).foregroundStyle(.secondary); if let error = item.lastError { Text(error).font(.caption).foregroundStyle(.red) } }; Spacer(); Text("\(item.nodeIDs.count) 个节点").foregroundStyle(.secondary); Button("更新") { Task { await model.refreshSubscription(item.id) } }.disabled(model.busy); Button(role: .destructive) { model.removeSubscription(item.id) } label: { Image(systemName: "trash") } } .padding(.vertical, 8) } }.listStyle(.inset)
+    var body: some View { VStack(alignment: .leading, spacing: 20) { HStack { Header(title: "订阅管理", subtitle: "订阅地址只保存在本机，不会上传"); Button("添加订阅", systemImage: "plus") { showingAdd = true }.buttonStyle(.borderedProminent).disabled(!model.config.subscriptions.isEmpty) }
+        List { ForEach(model.config.subscriptions) { item in HStack(spacing: 14) { Image(systemName: item.lastError == nil ? "checkmark.circle.fill" : "exclamationmark.triangle.fill").foregroundStyle(item.lastError == nil ? .green : .orange); VStack(alignment: .leading) { Text(item.name).fontWeight(.semibold); Text(item.updatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "尚未更新").font(.caption).foregroundStyle(.secondary); if let error = item.lastError { Text(error).font(.caption).foregroundStyle(.red) } }; Spacer(); Text("\(item.nodeIDs.count) 个节点").foregroundStyle(.secondary); Button("更新") { Task { await model.refreshSubscription(item.id) } }.disabled(model.busy || model.testingAll || !model.testingNodeIDs.isEmpty); Button(role: .destructive) { model.removeSubscription(item.id) } label: { Image(systemName: "trash") }.disabled(model.busy || model.testingAll || !model.testingNodeIDs.isEmpty) } .padding(.vertical, 8) } }.listStyle(.inset)
     }.padding(28).sheet(isPresented: $showingAdd) { AddSubscriptionSheet(isPresented: $showingAdd) } }
 }
 
 struct AddSubscriptionSheet: View {
     @EnvironmentObject var model: AppModel; @Binding var isPresented: Bool; @State private var name = "我的订阅"; @State private var url = ""
-    var body: some View { VStack(alignment: .leading, spacing: 18) { Text("添加订阅").font(.title2.bold()); TextField("名称", text: $name); SecureField("订阅地址", text: $url); Text("地址包含的令牌将加密显示，并仅保存在这台 Mac。 ").font(.caption).foregroundStyle(.secondary); HStack { Spacer(); Button("取消") { isPresented = false }; Button("添加并更新") { let n = name, u = url; isPresented = false; Task { await model.addSubscription(name: n, url: u) } }.buttonStyle(.borderedProminent).disabled(url.isEmpty) } }.padding(24).frame(width: 480) }
+    var body: some View { VStack(alignment: .leading, spacing: 18) { Text("添加订阅").font(.title2.bold()); TextField("名称", text: $name); SecureField("订阅地址", text: $url); Text("地址会在输入时隐藏，并仅保存在这台 Mac 的应用数据目录。 ").font(.caption).foregroundStyle(.secondary); HStack { Spacer(); Button("取消") { isPresented = false }; Button("添加并更新") { let n = name, u = url; isPresented = false; Task { await model.addSubscription(name: n, url: u) } }.buttonStyle(.borderedProminent).disabled(url.isEmpty) } }.padding(24).frame(width: 480) }
 }
 
 struct RulesView: View {
@@ -166,23 +168,25 @@ struct RulesView: View {
 
 struct ConnectionsView: View {
     @EnvironmentObject var model: AppModel
-    var body: some View { VStack(alignment: .leading, spacing: 20) { Header(title: "网络连接", subtitle: "查看每个目标的识别结果、命中规则和流量"); Table(model.connections) {
+    var body: some View { VStack(alignment: .leading, spacing: 20) { Header(title: "网络连接", subtitle: "来自 Mihomo 核心的真实连接快照，每秒更新"); if model.connections.isEmpty { VStack(spacing: 12) { Image(systemName: "network.slash").font(.system(size: 38)).foregroundStyle(.secondary); Text("暂无连接").font(.title3.bold()); Text(!model.running ? "请先启动代理" : !model.systemProxy ? "核心已启动；开启系统代理后，应用流量会显示在这里" : "打开网页或应用后，活动连接会显示在这里").foregroundStyle(.secondary) }.frame(maxWidth: .infinity, maxHeight: .infinity) } else { Table(model.connections) {
         TableColumn("目标") { Text("\($0.host):\($0.port)").font(.system(.body, design: .monospaced)) }
         TableColumn("类别") { Text($0.category.uppercased()) }.width(80)
         TableColumn("路线") { Text($0.action.rawValue).foregroundStyle($0.action == .direct ? .green : .blue) }.width(80)
         TableColumn("判断依据") { Text($0.rule) }
+        TableColumn("节点") { Text($0.node ?? "直连") }.width(140)
         TableColumn("流量") { Text("↑\(bytes($0.uploaded)) ↓\(bytes($0.downloaded))") }.width(150)
         TableColumn("状态") { Text($0.status) }.width(60)
-    }.tableStyle(.inset(alternatesRowBackgrounds: true)) }.padding(28) }
+    }.tableStyle(.inset(alternatesRowBackgrounds: true)) } }.padding(28) }
 }
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
         Form {
-            Section("本地代理") {
+            Section("代理核心") {
                 TextField("监听端口", value: $model.config.proxyPort, format: .number).onSubmit { model.save() }
-                Toggle("启动时开启本地代理", isOn: $model.config.proxyEnabled).onChange(of: model.config.proxyEnabled) { _ in model.save() }
+                Text("监听端口仅用于直连检查模式；规则和全局模式由核心自动分配端口。").font(.caption).foregroundStyle(.secondary)
+                Toggle("启动应用时启动代理核心", isOn: $model.config.proxyEnabled).onChange(of: model.config.proxyEnabled) { _ in model.save() }
             }
             Section("真实测速") {
                 Picker("测试目标", selection: $model.config.latencyTestTarget) { ForEach(LatencyTestTarget.allCases) { Text($0.title).tag($0) } }.onChange(of: model.config.latencyTestTarget) { _ in model.save() }
@@ -195,7 +199,7 @@ struct SettingsView: View {
                 Label("订阅令牌只保存在本机应用数据目录", systemImage: "lock.shield")
                 Label("代理仅监听 127.0.0.1，不接受局域网连接", systemImage: "laptopcomputer.and.iphone")
             }
-            Section { Text("智连 0.5.2 · 原生 macOS 应用").foregroundStyle(.secondary) }
+            Section { Text("智连 0.6.0 · 原生 macOS 应用").foregroundStyle(.secondary) }
         }.formStyle(.grouped).padding()
     }
 }

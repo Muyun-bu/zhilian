@@ -25,7 +25,7 @@ struct RootView: View {
                 HStack(spacing: 12) { Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 40, height: 40); VStack(alignment: .leading) { Text("智连").font(.title2.bold()); Text("智能网络分流").foregroundStyle(.secondary).font(.caption) } }.padding(.top, 18)
                 List(Page.allCases, selection: $page) { item in Label(item.rawValue, systemImage: item.icon).tag(item) }.listStyle(.sidebar)
                 Spacer()
-                VStack(alignment: .leading, spacing: 8) { Label(model.running ? "代理核心运行中" : "代理核心已停止", systemImage: model.running ? "checkmark.circle.fill" : "pause.circle").foregroundStyle(model.running ? .green : .secondary); Text(model.running && model.config.mode != .direct ? "Mihomo 直连模式" : "127.0.0.1:\(model.config.proxyPort)").font(.caption.monospaced()).foregroundStyle(.secondary) }.padding()
+                VStack(alignment: .leading, spacing: 8) { Label(model.running ? "代理核心运行中" : "代理核心已停止", systemImage: model.running ? "checkmark.circle.fill" : "pause.circle").foregroundStyle(model.running ? .green : .secondary); Text(model.runtimeProxyDescription).font(.caption.monospaced()).foregroundStyle(.secondary) }.padding()
             }.navigationSplitViewColumnWidth(min: 210, ideal: 230)
         } detail: {
             Group { switch page ?? .dashboard { case .dashboard: DashboardView(); case .nodes: NodesView(); case .subscriptions: SubscriptionsView(); case .rules: RulesView(); case .connections: ConnectionsView(); case .settings: SettingsView() } }

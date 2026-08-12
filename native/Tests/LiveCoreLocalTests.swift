@@ -11,11 +11,16 @@ struct LiveCoreLocalTests {
                 let rightDate = (try? right.appendingPathComponent("config.yaml").resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 return leftDate > rightDate
             }
-        let yaml = try String(contentsOf: directories.first!.appendingPathComponent("config.yaml"), encoding: .utf8)
+        guard let latestDirectory = directories.first else { throw TunnelError.connect("没有找到运行中的核心目录") }
+        let yaml = try String(contentsOf: latestDirectory.appendingPathComponent("config.yaml"), encoding: .utf8)
         func value(_ key: String) -> String? { yaml.split(separator: "\n").first { $0.trimmingCharacters(in: .whitespaces).hasPrefix(key + ":") }.map { String($0.split(separator: ":", maxSplits: 1)[1]).trimmingCharacters(in: CharacterSet(charactersIn: " '\"")) } }
-        let controller = value("external-controller")!, secret = value("secret")!, port = Int(controller.split(separator: ":").last!)!
+        guard let controller = value("external-controller"), let secret = value("secret"),
+              let portText = controller.split(separator: ":").last, let port = Int(portText),
+              let controllerURL = URL(string: "http://127.0.0.1:\(port)/proxies") else {
+            throw TunnelError.protocolError("核心配置缺少控制接口")
+        }
         let configuration = URLSessionConfiguration.ephemeral; configuration.connectionProxyDictionary = [:]
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/proxies")!)
+        var request = URLRequest(url: controllerURL)
         request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession(configuration: configuration).data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200,

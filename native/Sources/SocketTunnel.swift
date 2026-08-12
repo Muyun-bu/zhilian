@@ -13,10 +13,15 @@ enum TunnelError: LocalizedError {
 final class SocketFD: @unchecked Sendable {
     let fd: Int32
     private let closeLock = NSLock(); private var isClosed = false
-    init(fd: Int32) { self.fd = fd }
+    init(fd: Int32) {
+        self.fd = fd
+        var enabled: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size))
+    }
     deinit { close() }
 
     static func connect(host: String, port: Int, timeout: Int = 10) throws -> SocketFD {
+        guard !host.isEmpty, (1...65_535).contains(port) else { throw TunnelError.connect("目标地址或端口无效") }
         var hints = addrinfo(ai_flags: AI_ADDRCONFIG, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM, ai_protocol: IPPROTO_TCP,
                              ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
         var result: UnsafeMutablePointer<addrinfo>?
@@ -80,6 +85,9 @@ final class Socks5Tunnel: Tunnel, @unchecked Sendable {
     private let socket: SocketFD
 
     init(proxyHost: String = "127.0.0.1", proxyPort: Int, destinationHost: String, destinationPort: Int) throws {
+        guard !destinationHost.isEmpty, destinationHost.utf8.count <= 255, (1...65_535).contains(destinationPort) else {
+            throw TunnelError.connect("SOCKS5 目标地址无效")
+        }
         socket = try SocketFD.connect(host: proxyHost, port: proxyPort)
         try socket.write(Data([5, 1, 0]))
         let greeting = try socket.readExactly(2)
@@ -112,7 +120,9 @@ final class ShadowsocksTunnel: Tunnel, @unchecked Sendable {
     private var decryptNonce: UInt64 = 0
 
     init(node: ProxyNode, destinationHost: String, destinationPort: Int) throws {
-        guard node.method == "chacha20-ietf-poly1305", let password = node.password else { throw TunnelError.unsupported }
+        guard node.method == "chacha20-ietf-poly1305", let password = node.password,
+              !destinationHost.isEmpty, destinationHost.utf8.count <= 255,
+              (1...65_535).contains(destinationPort) else { throw TunnelError.unsupported }
         socket = try SocketFD.connect(host: node.host, port: node.port)
         masterKey = Self.evpBytesToKey(password: password, length: 32)
         try write(Self.address(host: destinationHost, port: destinationPort))
@@ -145,15 +155,17 @@ final class ShadowsocksTunnel: Tunnel, @unchecked Sendable {
     func close() { socket.close() }
 
     private func seal(_ data: Data) throws -> Data {
+        guard let encryptKey else { throw TunnelError.protocolError("加密密钥尚未初始化") }
         let nonce = try ChaChaPoly.Nonce(data: Self.nonce(encryptNonce)); encryptNonce += 1
-        let box = try ChaChaPoly.seal(data, using: encryptKey!, nonce: nonce)
+        let box = try ChaChaPoly.seal(data, using: encryptKey, nonce: nonce)
         return box.ciphertext + box.tag
     }
     private func open(_ data: Data) throws -> Data {
         guard data.count >= 16 else { throw TunnelError.protocolError("数据帧过短") }
+        guard let decryptKey else { throw TunnelError.protocolError("解密密钥尚未初始化") }
         let nonce = try ChaChaPoly.Nonce(data: Self.nonce(decryptNonce)); decryptNonce += 1
         let box = try ChaChaPoly.SealedBox(nonce: nonce, ciphertext: data.dropLast(16), tag: data.suffix(16))
-        return try ChaChaPoly.open(box, using: decryptKey!)
+        return try ChaChaPoly.open(box, using: decryptKey)
     }
     private static func nonce(_ value: UInt64) -> Data {
         var data = Data(count: 12); var little = value.littleEndian

@@ -82,8 +82,18 @@ final class IPDatabase {
     static func isPrivate(_ host: String) -> Bool {
         let value = host.lowercased()
         if value == "localhost" || value.hasSuffix(".local") { return true }
-        let parts = value.split(separator: ".").compactMap { Int($0) }
-        guard parts.count == 4 else { return value == "::1" || value.hasPrefix("fe80:") || value.hasPrefix("fc") || value.hasPrefix("fd") }
-        return parts[0] == 10 || parts[0] == 127 || (parts[0] == 192 && parts[1] == 168) || (parts[0] == 172 && (16...31).contains(parts[1]))
+        var address4 = in_addr()
+        if inet_pton(AF_INET, value, &address4) == 1 {
+            let octets = withUnsafeBytes(of: &address4.s_addr) { Array($0) }
+            return octets[0] == 10 || octets[0] == 127 || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 192 && octets[1] == 168) || (octets[0] == 172 && (16...31).contains(octets[1]))
+        }
+        var address6 = in6_addr()
+        if inet_pton(AF_INET6, value, &address6) == 1 {
+            let octets = withUnsafeBytes(of: &address6.__u6_addr.__u6_addr8) { Array($0) }
+            let isLoopback = octets.dropLast().allSatisfy { $0 == 0 } && octets.last == 1
+            return isLoopback || octets[0] == 0xfc || octets[0] == 0xfd || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+        return false
     }
 }

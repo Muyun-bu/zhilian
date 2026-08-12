@@ -1,5 +1,21 @@
 import Foundation
 
+private final class CoreDateParser: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fractional: ISO8601DateFormatter
+    private let standard = ISO8601DateFormatter()
+
+    init() {
+        fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    func date(from value: String) -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        return fractional.date(from: value) ?? standard.date(from: value)
+    }
+}
+
 final class MihomoCore: @unchecked Sendable {
     private static let providerName = "zhilian-subscription"
     private static let groupName = "智连节点"
@@ -15,15 +31,22 @@ final class MihomoCore: @unchecked Sendable {
     private var logHandle: FileHandle?
     private var logURL: URL?
     private let executableOverride: URL?
+    private let chinaIPRuleOverride: URL?
     private let lock = NSLock()
     private let controllerSession: URLSession
+    private static let dateParser = CoreDateParser()
 
-    private var corePIDURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ZhilianNative/core.pid")
+    private var supportRoot: URL {
+        if executableOverride != nil {
+            return FileManager.default.temporaryDirectory.appendingPathComponent("ZhilianCoreTest-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        }
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZhilianNative", isDirectory: true)
     }
 
-    init(protocolClasses: [AnyClass]? = nil, executableOverride: URL? = nil) {
+    private var corePIDURL: URL { supportRoot.appendingPathComponent("core.pid") }
+
+    init(protocolClasses: [AnyClass]? = nil, executableOverride: URL? = nil, chinaIPRuleOverride: URL? = nil) {
         // Every core gets its own local port trio.  It avoids a stale child
         // from an earlier app launch blocking the next launch; AppModel updates
         // macOS system proxy only after this new core has passed readiness.
@@ -32,6 +55,7 @@ final class MihomoCore: @unchecked Sendable {
         controllerPort = base + 1
         mixedPort = base + 2
         self.executableOverride = executableOverride
+        self.chinaIPRuleOverride = chinaIPRuleOverride
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [:]
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -39,9 +63,8 @@ final class MihomoCore: @unchecked Sendable {
         controllerSession = URLSession(configuration: configuration)
     }
 
-    /// `true` only after both the SOCKS listener and controller listener are accepting connections.
-    /// Keeping this stricter than `Process.isRunning` prevents the local HTTP proxy from sending
-    /// traffic to a core that has not finished loading the provider yet.
+    /// A process is assigned here only after all three local listeners pass the
+    /// startup readiness check. Runtime controller health is monitored by AppModel.
     var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return process?.isRunning == true }
 
     func start(providerFile: URL, selectedNode: String?, mode: ProxyMode = .rule, forceReload: Bool = false) throws {
@@ -57,16 +80,25 @@ final class MihomoCore: @unchecked Sendable {
         guard let executable = executableOverride ?? Bundle.main.url(forResource: "mihomo", withExtension: nil, subdirectory: "Core") else {
             throw TunnelError.connect("缺少多协议核心")
         }
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ZhilianNative/Core-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        try FileManager.default.createDirectory(at: supportRoot, withIntermediateDirectories: true)
+        let support = supportRoot.appendingPathComponent("Core-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
         try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         let providers = support.appendingPathComponent("providers", isDirectory: true)
         try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
         let localProvider = providers.appendingPathComponent("zhilian.yaml")
         try Data(contentsOf: providerFile).write(to: localProvider, options: .atomic)
+        let rulesDirectory = support.appendingPathComponent("rules", isDirectory: true)
+        try FileManager.default.createDirectory(at: rulesDirectory, withIntermediateDirectories: true)
+        let executableResource = executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("china-ip-cidrs.txt")
+        let chinaIPSource = chinaIPRuleOverride ?? Bundle.main.url(forResource: "china-ip-cidrs", withExtension: "txt")
+            ?? (FileManager.default.fileExists(atPath: executableResource.path) ? executableResource : nil)
+        if let chinaIPSource {
+            try Data(contentsOf: chinaIPSource).write(to: rulesDirectory.appendingPathComponent("china-ip-cidrs.txt"), options: .atomic)
+        }
         let configURL = support.appendingPathComponent("config.yaml")
         let config = Self.configuration(providerPath: "./providers/zhilian.yaml", socksPort: socksPort,
-                                        mixedPort: mixedPort, controllerPort: controllerPort, secret: secret, mode: mode)
+                                        mixedPort: mixedPort, controllerPort: controllerPort, secret: secret, mode: mode,
+                                        includeChinaIPRules: chinaIPSource != nil)
         try Data(config.utf8).write(to: configURL, options: .atomic)
         let coreLog = support.appendingPathComponent("core.log")
         try Data().write(to: coreLog, options: .atomic)
@@ -76,7 +108,8 @@ final class MihomoCore: @unchecked Sendable {
         task.arguments = ["-d", support.path, "-f", configURL.path]
         task.standardOutput = output
         task.standardError = output
-        try task.run()
+        do { try task.run() }
+        catch { output.closeFile(); throw error }
         var ready = false
         for _ in 0..<100 {
             let socksReady = (try? SocketFD.connect(host: "127.0.0.1", port: socksPort, timeout: 1)) != nil
@@ -87,7 +120,7 @@ final class MihomoCore: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.1)
         }
         guard ready, task.isRunning else {
-            if task.isRunning { task.terminate(); task.waitUntilExit() }
+            Self.terminateProcess(task)
             output.closeFile()
             throw TunnelError.connect("多协议核心未能启动。\(Self.startupDiagnostic(from: coreLog))")
         }
@@ -104,7 +137,7 @@ final class MihomoCore: @unchecked Sendable {
 
     func stop() {
         lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; currentMode = nil; logHandle = nil; logURL = nil; lock.unlock()
-        if task?.isRunning == true { task?.terminate() }
+        if let task { Self.terminateProcess(task) }
         removeRecordedPID(task?.processIdentifier)
         output?.closeFile()
     }
@@ -112,8 +145,7 @@ final class MihomoCore: @unchecked Sendable {
     func stopAndWait() {
         lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; currentMode = nil; logHandle = nil; logURL = nil; lock.unlock()
         if let task, task.isRunning {
-            task.terminate()
-            task.waitUntilExit()
+            Self.terminateProcess(task)
         }
         removeRecordedPID(task?.processIdentifier)
         output?.closeFile()
@@ -148,6 +180,27 @@ final class MihomoCore: @unchecked Sendable {
         }
     }
 
+    /// Returns the actual traffic and active connections handled by mihomo.
+    /// The production system proxy points directly at `mixedPort`, so these
+    /// values are authoritative while rule/global mode is running.
+    func connectionSnapshot() async throws -> CoreConnectionSnapshot {
+        let data = try await request(path: "/connections", method: "GET", body: nil, timeout: 3)
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TunnelError.connect("核心连接数据无效")
+        }
+        let uploadTotal = Self.int64(root["uploadTotal"])
+        let downloadTotal = Self.int64(root["downloadTotal"])
+        let memory = Self.int64(root["memory"])
+        let records = (root["connections"] as? [[String: Any]] ?? []).prefix(500).compactMap(Self.connectionRecord)
+        return .init(uploadTotal: uploadTotal, downloadTotal: downloadTotal, memory: memory, connections: records)
+    }
+
+    /// Verifies that the provider has populated the selector with at least one
+    /// usable node, rather than merely accepting the top-level YAML syntax.
+    func validateProviderLoaded() async throws {
+        try await waitUntilAvailable(node: nil)
+    }
+
     private func waitUntilAvailable(node: String?) async throws {
         var lastFailure: Error?
         for attempt in 0..<30 {
@@ -155,7 +208,9 @@ final class MihomoCore: @unchecked Sendable {
                 let data = try await request(path: "/proxies/\(Self.escapedPath(Self.groupName))", method: "GET", body: nil)
                 if let group = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let choices = group["all"] as? [String] {
-                    if node == nil || choices.contains(node!) { return }
+                    if let node {
+                        if choices.contains(node) { return }
+                    } else if !choices.isEmpty { return }
                 }
             } catch { lastFailure = error }
             if attempt < 29 { try? await Task.sleep(nanoseconds: 250_000_000) }
@@ -178,13 +233,32 @@ final class MihomoCore: @unchecked Sendable {
         return data
     }
 
-    private static func configuration(providerPath: String, socksPort: Int, mixedPort: Int, controllerPort: Int, secret: String, mode: ProxyMode) -> String {
+    private static func configuration(providerPath: String, socksPort: Int, mixedPort: Int, controllerPort: Int, secret: String, mode: ProxyMode, includeChinaIPRules: Bool) -> String {
         func quoted(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "''") + "'" }
+        let chinaIPRule = includeChinaIPRules ? "\n          - RULE-SET,zhilian-cn-ip,DIRECT" : ""
+        let ruleProviders = includeChinaIPRules ? """
+        rule-providers:
+          zhilian-cn-ip:
+            type: file
+            behavior: ipcidr
+            format: text
+            path: ./rules/china-ip-cidrs.txt
+        """ : ""
         let routingRules: String
         if mode == .global {
             routingRules = "          - MATCH,智连节点"
         } else {
             routingRules = """
+                      - DOMAIN,localhost,DIRECT
+                      - DOMAIN-SUFFIX,local,DIRECT
+                      - IP-CIDR,127.0.0.0/8,DIRECT
+                      - IP-CIDR,10.0.0.0/8,DIRECT
+                      - IP-CIDR,172.16.0.0/12,DIRECT
+                      - IP-CIDR,192.168.0.0/16,DIRECT
+                      - IP-CIDR,169.254.0.0/16,DIRECT
+                      - IP-CIDR6,::1/128,DIRECT
+                      - IP-CIDR6,fc00::/7,DIRECT
+                      - IP-CIDR6,fe80::/10,DIRECT
                       - DOMAIN-SUFFIX,cn,DIRECT
                       - DOMAIN-SUFFIX,baidu.com,DIRECT
                       - DOMAIN-SUFFIX,qq.com,DIRECT
@@ -203,6 +277,27 @@ final class MihomoCore: @unchecked Sendable {
                       - DOMAIN-SUFFIX,meituan.com,DIRECT
                       - DOMAIN-SUFFIX,amap.com,DIRECT
                       - DOMAIN-SUFFIX,alipay.com,DIRECT
+                      - DOMAIN-SUFFIX,openai.com,智连节点
+                      - DOMAIN-SUFFIX,chatgpt.com,智连节点
+                      - DOMAIN-SUFFIX,anthropic.com,智连节点
+                      - DOMAIN-SUFFIX,claude.ai,智连节点
+                      - DOMAIN-SUFFIX,perplexity.ai,智连节点
+                      - DOMAIN-SUFFIX,huggingface.co,智连节点
+                      - DOMAIN-SUFFIX,midjourney.com,智连节点
+                      - DOMAIN-SUFFIX,youtube.com,智连节点
+                      - DOMAIN-SUFFIX,netflix.com,智连节点
+                      - DOMAIN-SUFFIX,spotify.com,智连节点
+                      - DOMAIN-SUFFIX,hulu.com,智连节点
+                      - DOMAIN-SUFFIX,disneyplus.com,智连节点
+                      - DOMAIN-SUFFIX,twitch.tv,智连节点
+                      - DOMAIN-SUFFIX,vimeo.com,智连节点
+                      - DOMAIN-SUFFIX,twitter.com,智连节点
+                      - DOMAIN-SUFFIX,x.com,智连节点
+                      - DOMAIN-SUFFIX,facebook.com,智连节点
+                      - DOMAIN-SUFFIX,instagram.com,智连节点
+                      - DOMAIN-SUFFIX,telegram.org,智连节点
+                      - DOMAIN-SUFFIX,reddit.com,智连节点
+                      - DOMAIN-SUFFIX,discord.com,智连节点\(chinaIPRule)
                       - MATCH,智连节点
             """
         }
@@ -221,7 +316,7 @@ final class MihomoCore: @unchecked Sendable {
             path: \(quoted(providerPath))
             exclude-filter: '剩余流量|套餐到期|到期时间'
             health-check:
-              enable: true
+              enable: false
               url: https://www.gstatic.com/generate_204
               interval: 600
         proxy-groups:
@@ -229,6 +324,7 @@ final class MihomoCore: @unchecked Sendable {
             type: select
             use:
               - zhilian-subscription
+        \(ruleProviders)
         rules:
         \(routingRules)
         """
@@ -238,6 +334,63 @@ final class MihomoCore: @unchecked Sendable {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/?#")
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func connectionRecord(_ item: [String: Any]) -> ConnectionRecord? {
+        guard let identifier = item["id"] as? String, let id = UUID(uuidString: identifier) else { return nil }
+        let metadata = item["metadata"] as? [String: Any] ?? [:]
+        let host = nonEmpty(metadata["host"]) ?? nonEmpty(metadata["destinationIP"]) ?? "未知目标"
+        let port = int(metadata["destinationPort"])
+        let rule = nonEmpty(item["rule"]) ?? "MATCH"
+        let rulePayload = nonEmpty(item["rulePayload"])
+        let chains = item["chains"] as? [String] ?? []
+        let isDirect = chains.contains(where: { $0.caseInsensitiveCompare("DIRECT") == .orderedSame })
+        let action: RouteAction = isDirect ? .direct : .proxy
+        let node = chains.first(where: { $0 != Self.groupName && $0.caseInsensitiveCompare("DIRECT") != .orderedSame })
+        let startedAt = parseDate(nonEmpty(item["start"])) ?? Date()
+        let network = (nonEmpty(metadata["network"]) ?? "other").uppercased()
+        let connectionType = nonEmpty(metadata["type"])
+        let category = trafficCategory(host: host, fallback: connectionType.map { "\(network)/\($0.uppercased())" } ?? network)
+        return .init(id: id, host: host, port: port, category: category, action: action,
+                     rule: rulePayload.map { "\(rule) · \($0)" } ?? rule, node: node,
+                     startedAt: startedAt, endedAt: nil, uploaded: int64(item["upload"]),
+                     downloaded: int64(item["download"]), status: "活动")
+    }
+
+    private static func nonEmpty(_ value: Any?) -> String? {
+        guard let value = value as? String, !value.isEmpty else { return nil }
+        return value
+    }
+
+    private static func trafficCategory(host: String, fallback: String) -> String {
+        let domain = host.lowercased()
+        let groups: [(String, [String])] = [
+            ("国内", ["baidu.com", "qq.com", "wechat.com", "weixin.qq.com", "taobao.com", "tmall.com", "jd.com", "bilibili.com", "douyin.com", "zhihu.com", "weibo.com", "aliyun.com", "163.com", "xiaomi.com", "meituan.com", "amap.com", "alipay.com"]),
+            ("AI", ["openai.com", "chatgpt.com", "anthropic.com", "claude.ai", "perplexity.ai", "huggingface.co", "midjourney.com"]),
+            ("流媒体", ["youtube.com", "netflix.com", "spotify.com", "hulu.com", "disneyplus.com", "twitch.tv", "vimeo.com"]),
+            ("社交", ["twitter.com", "x.com", "facebook.com", "instagram.com", "telegram.org", "reddit.com", "discord.com"])
+        ]
+        return groups.first { _, suffixes in suffixes.contains { domain == $0 || domain.hasSuffix("." + $0) } }?.0 ?? fallback
+    }
+
+    private static func int(_ value: Any?) -> Int {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) ?? 0 }
+        return 0
+    }
+
+    private static func int64(_ value: Any?) -> Int64 {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) ?? 0 }
+        return 0
+    }
+
+    private static func parseDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        return dateParser.date(from: value)
     }
 
     private static func delayQuery(target: LatencyTestTarget = .google204, timeoutMilliseconds: Int = 8_000) -> String {
@@ -291,5 +444,17 @@ final class MihomoCore: @unchecked Sendable {
         task.waitUntilExit()
         let command = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return command.contains("/Applications/智连.app/Contents/Resources/Core/mihomo") || command.contains("ZhilianNative/Core-")
+    }
+
+    private static func terminateProcess(_ task: Process) {
+        if task.isRunning {
+            task.terminate()
+            for _ in 0..<40 {
+                if !task.isRunning { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if task.isRunning { _ = Darwin.kill(task.processIdentifier, SIGKILL) }
+        }
+        task.waitUntilExit()
     }
 }
