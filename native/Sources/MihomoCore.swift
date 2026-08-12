@@ -18,11 +18,16 @@ final class MihomoCore: @unchecked Sendable {
     private let lock = NSLock()
     private let controllerSession: URLSession
 
+    private var corePIDURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZhilianNative/core.pid")
+    }
+
     init(protocolClasses: [AnyClass]? = nil, executableOverride: URL? = nil) {
-        // Use a stable local range rather than a PID-derived port.  This avoids
-        // leaving macOS system proxy aimed at an unreachable port across a
-        // normal application restart, and keeps diagnostics predictable.
-        let base = 20_000
+        // Every core gets its own local port trio.  It avoids a stale child
+        // from an earlier app launch blocking the next launch; AppModel updates
+        // macOS system proxy only after this new core has passed readiness.
+        let base = 20_000 + (Int(ProcessInfo.processInfo.processIdentifier) % 10_000) * 3
         socksPort = base
         controllerPort = base + 1
         mixedPort = base + 2
@@ -48,6 +53,7 @@ final class MihomoCore: @unchecked Sendable {
             return
         }
         stopAndWait()
+        terminateRecordedCore()
         guard let executable = executableOverride ?? Bundle.main.url(forResource: "mihomo", withExtension: nil, subdirectory: "Core") else {
             throw TunnelError.connect("缺少多协议核心")
         }
@@ -92,12 +98,14 @@ final class MihomoCore: @unchecked Sendable {
         logHandle = output
         logURL = coreLog
         lock.unlock()
+        try? "\(task.processIdentifier)".write(to: corePIDURL, atomically: true, encoding: .utf8)
         if let selectedNode { Task { try? await self.select(node: selectedNode) } }
     }
 
     func stop() {
         lock.lock(); let task = process; let output = logHandle; process = nil; currentProviderPath = nil; currentMode = nil; logHandle = nil; logURL = nil; lock.unlock()
         if task?.isRunning == true { task?.terminate() }
+        removeRecordedPID(task?.processIdentifier)
         output?.closeFile()
     }
 
@@ -107,6 +115,7 @@ final class MihomoCore: @unchecked Sendable {
             task.terminate()
             task.waitUntilExit()
         }
+        removeRecordedPID(task?.processIdentifier)
         output?.closeFile()
     }
 
@@ -248,5 +257,39 @@ final class MihomoCore: @unchecked Sendable {
         guard let text = try? String(contentsOf: logURL, encoding: .utf8) else { return "请检查订阅格式或端口占用" }
         let lastLines = text.split(whereSeparator: \.isNewline).suffix(3).joined(separator: " · ")
         return lastLines.isEmpty ? "请检查订阅格式或端口占用" : lastLines
+    }
+
+    /// A normal app exit can leave a child core adopted by launchd before
+    /// AppKit delivers its termination notification. Record and reclaim only
+    /// our own previous PID, preventing a stale core from blocking fixed ports.
+    private func terminateRecordedCore() {
+        guard let text = try? String(contentsOf: corePIDURL, encoding: .utf8),
+              let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 else { return }
+        guard Self.isZhilianCore(pid: pid) else { try? FileManager.default.removeItem(at: corePIDURL); return }
+        _ = Darwin.kill(pid, SIGTERM)
+        for _ in 0..<20 {
+            if Darwin.kill(pid, 0) != 0 { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if Darwin.kill(pid, 0) == 0 { _ = Darwin.kill(pid, SIGKILL) }
+        try? FileManager.default.removeItem(at: corePIDURL)
+    }
+
+    private func removeRecordedPID(_ pid: Int32?) {
+        guard let pid,
+              let text = try? String(contentsOf: corePIDURL, encoding: .utf8),
+              text.trimmingCharacters(in: .whitespacesAndNewlines) == "\(pid)" else { return }
+        try? FileManager.default.removeItem(at: corePIDURL)
+    }
+
+    private static func isZhilianCore(pid: Int32) -> Bool {
+        let task = Process(); let output = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-p", "\(pid)", "-o", "command="]
+        task.standardOutput = output
+        guard (try? task.run()) != nil else { return false }
+        task.waitUntilExit()
+        let command = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return command.contains("/Applications/智连.app/Contents/Resources/Core/mihomo") || command.contains("ZhilianNative/Core-")
     }
 }

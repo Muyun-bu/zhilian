@@ -2,7 +2,7 @@
 
 智连是一款面向 Apple Silicon Mac 的原生 macOS 智能代理客户端。当前正式实现位于 [`native/`](native/)，使用 SwiftUI、Foundation 和内嵌 Mihomo 核心，提供本地 HTTP 代理、订阅管理、节点选择/测速、连接面板与国内/境外自动分流。
 
-> 版本：0.5.1 · 最低系统：macOS 13 · 架构：Apple Silicon（arm64）
+> 版本：0.5.2 · 最低系统：macOS 13 · 架构：Apple Silicon（arm64）
 
 ## 功能
 
@@ -24,8 +24,8 @@ cd native
 
 构建会生成以下文件到仓库上级目录的 `outputs/`：
 
-- `智连-0.5.1.dmg`
-- `智连-0.5.1-macOS.zip`
+- `智连-0.5.2.dmg`
+- `智连-0.5.2-macOS.zip`
 
 脚本会临时进行 ad-hoc 签名，适合本机测试。公开发布前请使用 Apple Developer ID 签名并完成 Apple 公证。
 

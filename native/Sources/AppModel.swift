@@ -74,7 +74,7 @@ final class AppModel: ObservableObject {
         }}
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.sampleTraffic() } }
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.server.stop(); self?.core.stopAndWait(); if self?.systemProxy == true { self?.setSystemProxy(false) } }
+            Task { @MainActor in self?.shutdownForTermination() }
         }
         if config.mode != .direct, !config.subscriptions.isEmpty {
             // Start from the saved provider first.  Waiting for an online refresh
@@ -131,6 +131,7 @@ final class AppModel: ObservableObject {
         }
         running = false; config.proxyEnabled = false; notice = "无法找到可用的本地代理端口"
     }
+    /// Explicit user action.  It also disables auto-start for the next launch.
     func stop() { if systemProxy { setSystemProxy(false) }; server.stop(); core.stopAndWait(); running = false; config.proxyEnabled = false; save() }
     func toggleServer() { running ? stop() : start() }
     func save() { store.save(config) }
@@ -153,7 +154,10 @@ final class AppModel: ObservableObject {
         } catch { config.subscriptions[index].lastError = error.localizedDescription; notice = error.localizedDescription }
         busy = false; save()
         if running, config.mode != .direct, let subscription = config.subscriptions.first {
-            do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode, forceReload: true) }
+            do {
+                try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: config.mode, forceReload: true)
+                if systemProxy { refreshSystemProxyEndpoint() }
+            }
             catch { notice = "核心重载失败：\(error.localizedDescription)" }
         }
     }
@@ -306,7 +310,12 @@ final class AppModel: ObservableObject {
         for service in services {
             let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
             let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(systemProxyPort)"])
-            if !web.success || !secure.success { failures.append(service) }
+            let expected = systemProxyPort
+            let appliedWeb = Self.proxyEndpoint(service: service, secure: false)
+            let appliedSecure = Self.proxyEndpoint(service: service, secure: true)
+            let verified = appliedWeb?.enabled == true && appliedWeb?.server == "127.0.0.1" && appliedWeb?.port == expected
+                && appliedSecure?.enabled == true && appliedSecure?.server == "127.0.0.1" && appliedSecure?.port == expected
+            if !web.success || !secure.success || !verified { failures.append(service) }
         }
         return failures
     }
@@ -325,6 +334,16 @@ final class AppModel: ObservableObject {
         previousUpload = totalUpload
         previousDownload = totalDownload
         if samples.count > 60 { samples.removeFirst() }
+    }
+
+    /// AppKit calls this on Quit.  Unlike the visible Stop button, process
+    /// cleanup must not silently change the user's "start on launch" choice.
+    private func shutdownForTermination() {
+        if systemProxy { setSystemProxy(false) }
+        server.stop()
+        core.stopAndWait()
+        running = false
+        save()
     }
     private func providerCacheURL(_ subscriptionID: String) -> URL {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ZhilianNative/Providers", isDirectory: true)
