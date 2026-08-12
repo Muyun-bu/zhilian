@@ -24,7 +24,9 @@ final class AppModel: ObservableObject {
     var selectedNode: ProxyNode? { config.nodes.first { $0.id == config.selectedNodeID } }
 
     init() {
-        config = ConfigStore().load()
+        let loadedConfig = ConfigStore().load()
+        config = loadedConfig
+        systemProxy = loadedConfig.systemProxyEnabled
         let ipURL = Bundle.main.url(forResource: "china-ip-ranges", withExtension: "txt")
         let router = RoutingEngine(database: IPDatabase(resourceURL: ipURL))
         server = ProxyServer(router: router)
@@ -47,7 +49,7 @@ final class AppModel: ObservableObject {
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.server.stop(); self?.core.stopAndWait(); if self?.systemProxy == true { self?.setSystemProxy(false) } }
         }
-        if !config.subscriptions.isEmpty {
+        if config.mode != .direct, !config.subscriptions.isEmpty {
             Task { [weak self] in
                 guard let self else { return }
                 for subscription in self.config.subscriptions { await self.refreshSubscription(subscription.id) }
@@ -59,7 +61,7 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
-        if let subscription = config.subscriptions.first {
+        if config.mode != .direct, let subscription = config.subscriptions.first {
             let cache = providerCacheURL(subscription.id)
             guard FileManager.default.fileExists(atPath: cache.path) else {
                 notice = "正在更新订阅，完成后自动启动代理"
@@ -108,7 +110,7 @@ final class AppModel: ObservableObject {
             notice = "已更新 \(nodes.count) 个节点"
         } catch { config.subscriptions[index].lastError = error.localizedDescription; notice = error.localizedDescription }
         busy = false; save()
-        if running, let subscription = config.subscriptions.first {
+        if running, config.mode != .direct, let subscription = config.subscriptions.first {
             do { try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, forceReload: true) }
             catch { notice = "核心重载失败：\(error.localizedDescription)" }
         }
@@ -180,13 +182,48 @@ final class AppModel: ObservableObject {
     }
 
     func setSystemProxy(_ enabled: Bool) {
+        if enabled && !running {
+            start()
+            guard running else {
+                systemProxy = false
+                config.systemProxyEnabled = false
+                save()
+                return
+            }
+        }
         let services = Self.networkServices()
         guard !services.isEmpty else { notice = "没有找到可配置的网络服务"; return }
-        for service in services {
-            _ = Self.run("/usr/sbin/networksetup", enabled ? ["-setwebproxy", service, "127.0.0.1", "\(config.proxyPort)"] : ["-setwebproxystate", service, "off"])
-            _ = Self.run("/usr/sbin/networksetup", enabled ? ["-setsecurewebproxy", service, "127.0.0.1", "\(config.proxyPort)"] : ["-setsecurewebproxystate", service, "off"])
+        var failures: [String] = []
+        if enabled {
+            config.systemProxyBackups = services.compactMap { service in
+                guard let web = Self.proxyEndpoint(service: service, secure: false),
+                      let secure = Self.proxyEndpoint(service: service, secure: true) else {
+                    failures.append(service)
+                    return nil
+                }
+                return .init(service: service, web: web, secureWeb: secure)
+            }
+            for service in services {
+                let web = Self.run("/usr/sbin/networksetup", ["-setwebproxy", service, "127.0.0.1", "\(config.proxyPort)"])
+                let secure = Self.run("/usr/sbin/networksetup", ["-setsecurewebproxy", service, "127.0.0.1", "\(config.proxyPort)"])
+                if !web.success || !secure.success { failures.append(service) }
+            }
+        } else {
+            let backups = Dictionary(uniqueKeysWithValues: config.systemProxyBackups.map { ($0.service, $0) })
+            for service in services {
+                let backup = backups[service]
+                let webRestored = Self.restoreProxy(service: service, endpoint: backup?.web, secure: false)
+                let secureRestored = Self.restoreProxy(service: service, endpoint: backup?.secureWeb, secure: true)
+                if !webRestored || !secureRestored {
+                    failures.append(service)
+                }
+            }
+            config.systemProxyBackups = []
         }
-        systemProxy = enabled
+        systemProxy = enabled && failures.isEmpty
+        config.systemProxyEnabled = systemProxy
+        save()
+        if !failures.isEmpty { notice = "系统代理未能应用到：\(failures.sorted().joined(separator: "、"))" }
     }
 
     private func sampleTraffic() { samples.append(.init(upload: totalUpload - previousUpload, download: totalDownload - previousDownload)); previousUpload = totalUpload; previousDownload = totalDownload; if samples.count > 60 { samples.removeFirst() } }
@@ -195,6 +232,32 @@ final class AppModel: ObservableObject {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory.appendingPathComponent(subscriptionID + ".yaml")
     }
-    private static func networkServices() -> [String] { run("/usr/sbin/networksetup", ["-listallnetworkservices"]).split(separator: "\n").dropFirst().map(String.init).filter { !$0.hasPrefix("*") } }
-    private static func run(_ path: String, _ args: [String]) -> String { let process = Process(); let pipe = Pipe(); process.executableURL = URL(fileURLWithPath: path); process.arguments = args; process.standardOutput = pipe; process.standardError = Pipe(); try? process.run(); process.waitUntilExit(); return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "" }
+    private static func networkServices() -> [String] { run("/usr/sbin/networksetup", ["-listallnetworkservices"]).output.split(separator: "\n").dropFirst().map(String.init).filter { !$0.hasPrefix("*") } }
+    private static func proxyEndpoint(service: String, secure: Bool) -> SystemProxyEndpoint? {
+        let result = run("/usr/sbin/networksetup", [secure ? "-getsecurewebproxy" : "-getwebproxy", service])
+        guard result.success else { return nil }
+        var values: [String: String] = [:]
+        for line in result.output.split(separator: "\n") {
+            let pair = line.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+            if pair.count == 2 { values[pair[0]] = pair[1] }
+        }
+        guard let state = values["Enabled"] else { return nil }
+        return .init(enabled: state.caseInsensitiveCompare("Yes") == .orderedSame, server: values["Server"] ?? "", port: Int(values["Port"] ?? "") ?? 0)
+    }
+    private static func restoreProxy(service: String, endpoint: SystemProxyEndpoint?, secure: Bool) -> Bool {
+        let stateFlag = secure ? "-setsecurewebproxystate" : "-setwebproxystate"
+        let setFlag = secure ? "-setsecurewebproxy" : "-setwebproxy"
+        guard let endpoint, endpoint.enabled, !endpoint.server.isEmpty, endpoint.port > 0 else {
+            return run("/usr/sbin/networksetup", [stateFlag, service, "off"]).success
+        }
+        return run("/usr/sbin/networksetup", [setFlag, service, endpoint.server, "\(endpoint.port)"]).success
+    }
+    private static func run(_ path: String, _ args: [String]) -> (success: Bool, output: String) {
+        let process = Process(); let output = Pipe(); let error = Pipe()
+        process.executableURL = URL(fileURLWithPath: path); process.arguments = args; process.standardOutput = output; process.standardError = error
+        do { try process.run() } catch { return (false, error.localizedDescription) }
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile() + error.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus == 0, String(data: data, encoding: .utf8) ?? "")
+    }
 }

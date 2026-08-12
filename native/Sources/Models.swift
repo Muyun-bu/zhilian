@@ -63,6 +63,20 @@ struct SubscriptionProfile: Codable, Identifiable, Hashable {
     var lastError: String?
 }
 
+/// The previous values changed through `networksetup`, so disabling Zhilian can
+/// restore a user's own proxy configuration instead of simply turning it off.
+struct SystemProxyEndpoint: Codable, Hashable {
+    var enabled: Bool
+    var server: String
+    var port: Int
+}
+
+struct SystemProxyBackup: Codable, Hashable {
+    var service: String
+    var web: SystemProxyEndpoint
+    var secureWeb: SystemProxyEndpoint
+}
+
 struct RoutingRule: Codable, Identifiable, Hashable {
     var id: String
     var name: String
@@ -103,6 +117,25 @@ struct PersistedConfig: Codable {
     var nodes: [ProxyNode] = []
     var subscriptions: [SubscriptionProfile] = []
     var customRules: [RoutingRule] = []
+    var systemProxyEnabled = false
+    var systemProxyBackups: [SystemProxyBackup] = []
+
+    // Config files written by older versions have no system-proxy keys. Using
+    // decodeIfPresent preserves those subscriptions and nodes during upgrades.
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try values.decodeIfPresent(ProxyMode.self, forKey: .mode) ?? .rule
+        proxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .proxyEnabled) ?? true
+        selectedNodeID = try values.decodeIfPresent(String.self, forKey: .selectedNodeID)
+        proxyPort = try values.decodeIfPresent(Int.self, forKey: .proxyPort) ?? 7897
+        nodes = try values.decodeIfPresent([ProxyNode].self, forKey: .nodes) ?? []
+        subscriptions = try values.decodeIfPresent([SubscriptionProfile].self, forKey: .subscriptions) ?? []
+        customRules = try values.decodeIfPresent([RoutingRule].self, forKey: .customRules) ?? []
+        systemProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .systemProxyEnabled) ?? false
+        systemProxyBackups = try values.decodeIfPresent([SystemProxyBackup].self, forKey: .systemProxyBackups) ?? []
+    }
 }
 
 extension RoutingRule {

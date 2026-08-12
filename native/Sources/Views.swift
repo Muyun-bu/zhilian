@@ -110,7 +110,7 @@ struct SettingsView: View {
                 Label("订阅令牌只保存在本机应用数据目录", systemImage: "lock.shield")
                 Label("代理仅监听 127.0.0.1，不接受局域网连接", systemImage: "laptopcomputer.and.iphone")
             }
-            Section { Text("智连 0.4.5 · 原生 macOS 应用").foregroundStyle(.secondary) }
+            Section { Text("智连 0.4.6 · 原生 macOS 应用").foregroundStyle(.secondary) }
         }.formStyle(.grouped).padding()
     }
 }
