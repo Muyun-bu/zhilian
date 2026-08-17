@@ -41,12 +41,12 @@ PACKAGE_APP="$PACKAGE_STAGE/智连.app"
 /usr/bin/xattr -cr "$PACKAGE_APP" 2>/dev/null || true
 /usr/bin/codesign --force --deep --sign - "$PACKAGE_APP"
 /usr/bin/codesign --verify --deep --strict "$PACKAGE_APP"
-/bin/rm -f "$OUTPUT/智连-0.6.0-macOS.zip"
-/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_APP" "$OUTPUT/智连-0.6.0-macOS.zip"
+/bin/rm -f "$OUTPUT/智连-0.6.1-macOS.zip"
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_APP" "$OUTPUT/智连-0.6.1-macOS.zip"
 
 /bin/ln -s /Applications "$PACKAGE_STAGE/Applications"
-/bin/rm -f "$OUTPUT/智连-0.6.0.dmg"
-if ! /usr/bin/hdiutil create -volname "智连" -srcfolder "$PACKAGE_STAGE" -ov -format UDZO "$OUTPUT/智连-0.6.0.dmg"; then
-  /usr/bin/hdiutil makehybrid -hfs -hfs-volume-name "智连" -o "$OUTPUT/智连-0.6.0.dmg" "$PACKAGE_STAGE"
+/bin/rm -f "$OUTPUT/智连-0.6.1.dmg"
+if ! /usr/bin/hdiutil create -volname "智连" -srcfolder "$PACKAGE_STAGE" -ov -format UDZO "$OUTPUT/智连-0.6.1.dmg"; then
+  /usr/bin/hdiutil makehybrid -hfs -hfs-volume-name "智连" -o "$OUTPUT/智连-0.6.1.dmg" "$PACKAGE_STAGE"
 fi
 echo "$APP"

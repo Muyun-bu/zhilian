@@ -1,7 +1,10 @@
 import Foundation
 
 final class MockCoreProtocol: URLProtocol {
-    static var methods: [String] = []
+    // URLProtocol callbacks are serialized by this test's ephemeral session.
+    // Mark the test-only recorder explicitly so Swift 6 does not infer an
+    // application-level shared-state contract from the fixture.
+    nonisolated(unsafe) static var methods: [String] = []
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "127.0.0.1" }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {

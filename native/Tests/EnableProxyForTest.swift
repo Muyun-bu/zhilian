@@ -8,6 +8,7 @@ struct EnableProxyForTest {
         var config = store.load()
         config.proxyEnabled = enabled
         config.systemProxyEnabled = enabled
+        config.autoConnectOnLaunch = enabled
         store.save(config)
         print(enabled ? "代理核心和系统代理已设为测试启动状态" : "测试启动状态已关闭")
     }

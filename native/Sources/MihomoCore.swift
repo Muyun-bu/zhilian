@@ -132,6 +132,12 @@ final class MihomoCore: @unchecked Sendable {
         logURL = coreLog
         lock.unlock()
         try? "\(task.processIdentifier)".write(to: corePIDURL, atomically: true, encoding: .utf8)
+        do {
+            try waitForProviderGroupSynchronously(task: task, coreLog: coreLog)
+        } catch {
+            stopAndWait()
+            throw error
+        }
         if let selectedNode { Task { try? await self.select(node: selectedNode) } }
     }
 
@@ -334,6 +340,59 @@ final class MihomoCore: @unchecked Sendable {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/?#")
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    /// Listener sockets become available slightly before file providers are
+    /// populated. Do not let AppModel publish a connected state or redirect
+    /// macOS traffic until the selector has real choices.
+    private func waitForProviderGroupSynchronously(task: Process, coreLog: URL) throws {
+        var lastError: Error?
+        for attempt in 0..<120 {
+            guard task.isRunning else {
+                throw TunnelError.connect("多协议核心在加载节点时退出。\(Self.startupDiagnostic(from: coreLog))")
+            }
+            do {
+                if try providerGroupHasChoicesSynchronously() { return }
+            } catch {
+                lastError = error
+            }
+            if attempt < 119 { Thread.sleep(forTimeInterval: 0.1) }
+        }
+        if let lastError {
+            throw TunnelError.connect("核心节点组加载超时：\(lastError.localizedDescription)")
+        }
+        throw TunnelError.connect("核心节点组为空，请更新订阅后重试")
+    }
+
+    private func providerGroupHasChoicesSynchronously() throws -> Bool {
+        let socket = try SocketFD.connect(host: "127.0.0.1", port: controllerPort, timeout: 1)
+        defer { socket.close() }
+        let path = "/proxies/\(Self.escapedPath(Self.groupName))"
+        let request = "GET \(path) HTTP/1.1\r\n"
+            + "Host: 127.0.0.1:\(controllerPort)\r\n"
+            + "Authorization: Bearer \(secret)\r\n"
+            + "Accept: application/json\r\n"
+            + "Connection: close\r\n\r\n"
+        try socket.write(Data(request.utf8))
+        var response = Data()
+        while response.count < 256 * 1_024 {
+            let chunk = try socket.read(max: 32_768)
+            if chunk.isEmpty { break }
+            response.append(chunk)
+        }
+        guard let separator = response.range(of: Data("\r\n\r\n".utf8)) else {
+            throw TunnelError.protocolError("核心就绪响应不完整")
+        }
+        let header = String(data: response[..<separator.lowerBound], encoding: .utf8) ?? ""
+        guard header.hasPrefix("HTTP/1.1 200") || header.hasPrefix("HTTP/1.0 200") else {
+            throw TunnelError.connect("核心节点组尚未就绪")
+        }
+        let body = response[separator.upperBound...]
+        guard let object = try JSONSerialization.jsonObject(with: Data(body)) as? [String: Any],
+              let choices = object["all"] as? [String] else {
+            throw TunnelError.protocolError("核心节点组响应无效")
+        }
+        return !choices.isEmpty
     }
 
     private static func connectionRecord(_ item: [String: Any]) -> ConnectionRecord? {

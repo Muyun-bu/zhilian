@@ -8,6 +8,19 @@ enum ProxyMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum ConnectionTransition: Equatable {
+    case connecting
+    case disconnecting
+}
+
+enum ConnectionState: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case disconnecting
+    case needsRepair
+}
+
 enum LatencyTestTarget: String, Codable, CaseIterable, Identifiable {
     case google204, cloudflareTrace
     var id: String { rawValue }
@@ -64,6 +77,38 @@ struct ProxyNode: Codable, Identifiable, Hashable {
     var supported: Bool
     var lastLatency: Int?
     var lastError: String?
+}
+
+extension ProxyNode {
+    var isAccountMetadata: Bool {
+        ["剩余流量", "套餐到期", "到期时间", "长期有效"].contains { name.contains($0) }
+    }
+
+    var isSelectableProxy: Bool { supported && !isAccountMetadata }
+
+    var regionLabel: String {
+        if isAccountMetadata { return "账户信息" }
+        let value = name.lowercased()
+        let mappings: [(String, [String])] = [
+            ("香港", ["香港", "hong kong", "🇭🇰", " hk"]),
+            ("台湾", ["台湾", "taiwan", "🇹🇼", " tw"]),
+            ("新加坡", ["新加坡", "singapore", "🇸🇬", " sg"]),
+            ("日本", ["日本", "japan", "🇯🇵", " jp"]),
+            ("美国", ["美国", "united states", "usa", "🇺🇸", " us"]),
+            ("韩国", ["韩国", "korea", "🇰🇷", " kr"]),
+            ("英国", ["英国", "united kingdom", "🇬🇧", " uk"]),
+            ("德国", ["德国", "germany", "🇩🇪", " de"]),
+            ("菲律宾", ["菲律宾", "philippines", "🇵🇭", " ph"]),
+            ("加拿大", ["加拿大", "canada", "🇨🇦", " ca"]),
+            ("澳大利亚", ["澳大利亚", "澳洲", "australia", "🇦🇺", " au"]),
+            ("法国", ["法国", "france", "🇫🇷", " fr"]),
+            ("印度", ["印度", "india", "🇮🇳", " in"]),
+            ("荷兰", ["荷兰", "netherlands", "🇳🇱", " nl"])
+        ]
+        return mappings.first { mapping in
+            mapping.1.contains { value.contains($0) }
+        }?.0 ?? "其他"
+    }
 }
 
 struct SubscriptionProfile: Codable, Identifiable, Hashable {
@@ -145,6 +190,7 @@ struct PersistedConfig: Codable {
     var latencyTimeoutMilliseconds = 8_000
     var systemProxyEnabled = false
     var systemProxyBackups: [SystemProxyBackup] = []
+    var autoConnectOnLaunch = false
 
     // Config files written by older versions have no system-proxy keys. Using
     // decodeIfPresent preserves those subscriptions and nodes during upgrades.
@@ -163,6 +209,8 @@ struct PersistedConfig: Codable {
         latencyTimeoutMilliseconds = try values.decodeIfPresent(Int.self, forKey: .latencyTimeoutMilliseconds) ?? 8_000
         systemProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .systemProxyEnabled) ?? false
         systemProxyBackups = try values.decodeIfPresent([SystemProxyBackup].self, forKey: .systemProxyBackups) ?? []
+        autoConnectOnLaunch = try values.decodeIfPresent(Bool.self, forKey: .autoConnectOnLaunch)
+            ?? (proxyEnabled && systemProxyEnabled)
     }
 }
 

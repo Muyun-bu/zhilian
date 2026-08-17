@@ -12,7 +12,7 @@ struct LiveMihomoIntegrationTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[1])
         let provider = URL(fileURLWithPath: CommandLine.arguments[2])
         let nodes = SubscriptionService().parse(data: try Data(contentsOf: provider), sourceID: "live")
-        guard let selected = nodes.first(where: \.supported)?.name else {
+        guard let selected = nodes.first(where: \.isSelectableProxy)?.name else {
             throw TunnelError.connect("测试订阅中没有可用节点")
         }
 
@@ -26,6 +26,6 @@ struct LiveMihomoIntegrationTests {
         }
         try await core.select(node: node)
         let singleLatency = try await core.latency(node: node)
-        print("PASS: 核心已加载 \(nodes.filter(\.supported).count) 个可用节点，组测速 \(latencies.count) 个，单节点 \(node) 为 \(singleLatency) ms（组测速 \(latency) ms）")
+        print("PASS: 核心已加载 \(nodes.filter(\.isSelectableProxy).count) 个可选节点，组测速 \(latencies.count) 个，单节点 \(node) 为 \(singleLatency) ms（组测速 \(latency) ms）")
     }
 }

@@ -38,6 +38,8 @@ final class AppModel: ObservableObject {
     @Published var busy = false
     @Published var testingAll = false
     @Published private(set) var testingNodeIDs: Set<String> = []
+    @Published private(set) var selectingNodeID: String?
+    @Published private(set) var connectionTransition: ConnectionTransition?
     let store = ConfigStore()
     private let server: ProxyServer
     private let subscriptionService = SubscriptionService()
@@ -57,6 +59,16 @@ final class AppModel: ObservableObject {
 
     var rules: [RoutingRule] { RoutingRule.builtIns + config.customRules }
     var selectedNode: ProxyNode? { config.nodes.first { $0.id == config.selectedNodeID } }
+    var connectionState: ConnectionState {
+        switch connectionTransition {
+        case .connecting: return .connecting
+        case .disconnecting: return .disconnecting
+        case nil: break
+        }
+        if running && systemProxy { return .connected }
+        if running || systemProxy { return .needsRepair }
+        return .disconnected
+    }
     var runtimeProxyDescription: String {
         guard running else { return "未监听" }
         return config.mode != .direct ? "Mihomo · 127.0.0.1:\(core.mixedPort)" : "HTTP · 127.0.0.1:\(config.proxyPort)"
@@ -68,8 +80,9 @@ final class AppModel: ObservableObject {
     init() {
         let loadedConfig = ConfigStore().load()
         config = loadedConfig
-        // `systemProxyEnabled` is the user's persisted preference. Runtime
-        // state becomes true only after macOS confirms the new endpoint.
+        // Persisted flags describe whether the previous session requested a
+        // complete connection. Runtime state becomes true only after macOS
+        // confirms the new endpoint.
         systemProxy = false
         let ipURL = Bundle.main.url(forResource: "china-ip-ranges", withExtension: "txt")
         let router = RoutingEngine(database: IPDatabase(resourceURL: ipURL))
@@ -102,29 +115,35 @@ final class AppModel: ObservableObject {
         // A crash can leave macOS pointing at a dead local port. If the user
         // did not ask Zhilian to re-enable system proxy on this launch, restore
         // the saved pre-Zhilian settings before doing anything online.
-        if (!config.systemProxyEnabled || !config.proxyEnabled), !config.systemProxyBackups.isEmpty {
+        let shouldAutoConnect = config.autoConnectOnLaunch
+        config.proxyEnabled = shouldAutoConnect
+        config.systemProxyEnabled = shouldAutoConnect
+        if !shouldAutoConnect, !config.systemProxyBackups.isEmpty {
             setSystemProxy(false)
         }
         if config.mode != .direct, !config.subscriptions.isEmpty {
             // Start from the saved provider first.  Waiting for an online refresh
             // here can deadlock startup when macOS still points at a former local
             // proxy port; start() immediately rebinds system proxy to this core.
-            if config.proxyEnabled, let subscription = config.subscriptions.first,
+            if shouldAutoConnect, let subscription = config.subscriptions.first,
                FileManager.default.fileExists(atPath: providerCacheURL(subscription.id).path) { start() }
             Task { [weak self] in
                 guard let self else { return }
                 for subscription in self.config.subscriptions { await self.refreshSubscription(subscription.id) }
-                if self.config.proxyEnabled && !self.running { self.start() }
+                if self.config.proxyEnabled && self.config.systemProxyEnabled && !self.running { self.start() }
             }
-        } else if config.proxyEnabled {
+        } else if shouldAutoConnect {
             start()
         }
     }
 
     func start() {
-        guard !busy, !testingAll, testingNodeIDs.isEmpty else {
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else {
             notice = "请等待当前操作完成后再启动代理"
             return
+        }
+        if connectionTransition == nil, config.systemProxyEnabled {
+            connectionTransition = .connecting
         }
         if config.mode != .direct, let subscription = config.subscriptions.first {
             let cache = providerCacheURL(subscription.id)
@@ -143,6 +162,7 @@ final class AppModel: ObservableObject {
                         } else if !FileManager.default.fileExists(atPath: cache.path) {
                             self.config.proxyEnabled = false
                             self.config.systemProxyEnabled = false
+                            self.connectionTransition = nil
                             self.save()
                         }
                     }
@@ -152,6 +172,10 @@ final class AppModel: ObservableObject {
             do { try core.start(providerFile: cache, selectedNode: selectedNode?.name, mode: config.mode) }
             catch { failSafeAfterCoreFailure("代理核心启动失败：\(error.localizedDescription)"); return }
         } else if config.mode != .direct {
+            config.proxyEnabled = false
+            config.systemProxyEnabled = false
+            connectionTransition = nil
+            save()
             notice = "请先添加并更新订阅，再启动代理"
             return
         }
@@ -163,28 +187,119 @@ final class AppModel: ObservableObject {
             config.proxyEnabled = true
             resetNetworkPanel()
             save()
-            if config.systemProxyEnabled { setSystemProxy(true) }
+            completeConnectionActivation()
             return
         }
         let requestedPort = config.proxyPort
         guard (1...65_535).contains(requestedPort) else {
-            running = false; config.proxyEnabled = false; notice = "监听端口必须在 1 到 65535 之间"; save(); return
+            running = false; config.proxyEnabled = false; config.systemProxyEnabled = false
+            connectionTransition = nil; notice = "监听端口必须在 1 到 65535 之间"; save(); return
         }
         let lastPort = min(65_535, requestedPort + 20)
         for port in requestedPort...lastPort {
             do {
                 try server.start(port: port)
                 config.proxyPort = port; running = true; config.proxyEnabled = true; save()
-                if config.systemProxyEnabled { setSystemProxy(true) }
+                completeConnectionActivation()
                 if port != requestedPort { notice = "端口 \(requestedPort) 被占用，已自动切换到 \(port)" }
                 return
             } catch { continue }
         }
-        running = false; config.proxyEnabled = false; notice = "无法找到可用的本地代理端口"
+        running = false; config.proxyEnabled = false; config.systemProxyEnabled = false
+        connectionTransition = nil; notice = "无法找到可用的本地代理端口"; save()
     }
-    /// Explicit user action.  It also disables auto-start for the next launch.
-    func stop() { if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }; server.stop(); core.stopAndWait(); running = false; config.proxyEnabled = false; resetNetworkPanel(); save() }
-    func toggleServer() { running ? stop() : start() }
+
+    func connect() {
+        guard connectionTransition == nil else { return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else {
+            notice = "请等待当前操作完成后再连接网络"
+            return
+        }
+        connectionTransition = .connecting
+        config.proxyEnabled = true
+        config.systemProxyEnabled = true
+        save()
+        if running {
+            completeConnectionActivation()
+        } else {
+            start()
+        }
+    }
+
+    /// Restores the previous macOS proxy before stopping the local endpoint.
+    /// If an owned proxy cannot be restored, keep the core alive so the Mac is
+    /// not left pointing at a dead port.
+    @discardableResult
+    func stop() -> Bool {
+        connectionTransition = .disconnecting
+        let expectedPort = lastAppliedSystemProxyPort ?? (running ? systemProxyPort : nil)
+        if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
+        if let expectedPort, Self.anyServicePointsToLocalPort(expectedPort) {
+            config.proxyEnabled = true
+            config.systemProxyEnabled = false
+            connectionTransition = nil
+            save()
+            notice = "系统网络设置尚未完全恢复；为避免断网，代理核心将继续运行，请再次点击断开重试"
+            return false
+        }
+        server.stop()
+        core.stopAndWait()
+        running = false
+        systemProxy = false
+        config.proxyEnabled = false
+        config.systemProxyEnabled = false
+        connectionTransition = nil
+        resetNetworkPanel()
+        save()
+        return true
+    }
+
+    func toggleConnection() {
+        guard connectionTransition == nil else { return }
+        switch connectionState {
+        case .disconnected: connect()
+        case .connected, .needsRepair: _ = stop()
+        case .connecting, .disconnecting: break
+        }
+    }
+
+    func setAutoConnectOnLaunch(_ enabled: Bool) {
+        config.autoConnectOnLaunch = enabled
+        save()
+    }
+
+    private func completeConnectionActivation() {
+        guard running else {
+            connectionTransition = nil
+            return
+        }
+        guard config.systemProxyEnabled else {
+            connectionTransition = nil
+            return
+        }
+        setSystemProxy(true)
+        guard systemProxy else {
+            let failure = notice ?? "系统代理未能启用"
+            connectionTransition = nil
+            if !Self.anyServicePointsToLocalPort(systemProxyPort) {
+                server.stop()
+                core.stopAndWait()
+                running = false
+                config.proxyEnabled = false
+                config.systemProxyEnabled = false
+                resetNetworkPanel()
+                save()
+                notice = "连接失败，系统网络已回滚：\(failure)"
+            } else {
+                config.proxyEnabled = true
+                save()
+                notice = "系统网络未完全应用，代理核心保持运行以避免断网：\(failure)"
+            }
+            return
+        }
+        connectionTransition = nil
+    }
+
     func save() { store.save(config) }
 
     func addSubscription(name: String, url: String) async {
@@ -197,7 +312,7 @@ final class AppModel: ObservableObject {
     }
     func refreshSubscription(_ id: String) async {
         guard !busy else { return }
-        guard !testingAll, testingNodeIDs.isEmpty else { notice = "请等待节点测速完成后再更新订阅"; return }
+        guard !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else { notice = "请等待节点操作完成后再更新订阅"; return }
         guard let profile = config.subscriptions.first(where: { $0.id == id }) else { return }
         let cache = providerCacheURL(id)
         let oldDocument = try? Data(contentsOf: cache)
@@ -223,8 +338,8 @@ final class AppModel: ObservableObject {
             guard let index = config.subscriptions.firstIndex(where: { $0.id == id }) else { return }
             config.nodes.removeAll { $0.sourceID == id }; config.nodes.append(contentsOf: nodes)
             config.subscriptions[index].nodeIDs = nodes.map(\.id); config.subscriptions[index].updatedAt = Date(); config.subscriptions[index].lastError = nil
-            if !nodes.contains(where: { $0.id == config.selectedNodeID && $0.supported }) {
-                config.selectedNodeID = nodes.first(where: \.supported)?.id
+            if !nodes.contains(where: { $0.id == config.selectedNodeID && $0.isSelectableProxy }) {
+                config.selectedNodeID = nodes.first(where: \.isSelectableProxy)?.id
             }
             notice = "已更新 \(nodes.count) 个节点"
         } catch {
@@ -271,20 +386,20 @@ final class AppModel: ObservableObject {
         }
     }
     func removeSubscription(_ id: String) {
-        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再删除订阅"; return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else { notice = "请等待当前操作完成后再删除订阅"; return }
         let removingActive = config.subscriptions.first?.id == id && running && config.mode != .direct
         if removingActive { stop() }
         config.nodes.removeAll { $0.sourceID == id }
         config.subscriptions.removeAll { $0.id == id }
         try? FileManager.default.removeItem(at: providerCacheURL(id))
-        if !config.nodes.contains(where: { $0.id == config.selectedNodeID }) { config.selectedNodeID = config.nodes.first(where: \.supported)?.id }
+        if !config.nodes.contains(where: { $0.id == config.selectedNodeID && $0.isSelectableProxy }) { config.selectedNodeID = config.nodes.first(where: \.isSelectableProxy)?.id }
         save()
     }
 
     func testNode(_ id: String) async {
-        guard !busy, !testingAll, testingNodeIDs.isEmpty else { return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else { return }
         guard let node = config.nodes.first(where: { $0.id == id }) else { return }
-        guard node.supported else { return }
+        guard node.isSelectableProxy else { return }
         guard let subscription = config.subscriptions.first, subscription.id == node.sourceID else {
             notice = "该节点不属于当前活动订阅"
             return
@@ -314,9 +429,12 @@ final class AppModel: ObservableObject {
     }
 
     func selectNode(_ id: String) async {
-        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再切换节点"; return }
-        guard let node = config.nodes.first(where: { $0.id == id }), node.supported else { return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else { notice = "请等待当前操作完成后再切换节点"; return }
+        guard let node = config.nodes.first(where: { $0.id == id }), node.isSelectableProxy else { return }
         guard config.subscriptions.first?.id == node.sourceID else { notice = "该节点不属于当前活动订阅"; return }
+        guard config.selectedNodeID != id else { return }
+        selectingNodeID = id
+        defer { selectingNodeID = nil }
         if core.isRunning {
             do {
                 try await core.select(node: node.name)
@@ -330,7 +448,7 @@ final class AppModel: ObservableObject {
 
     func testAllNodes(ids: [String]? = nil) async {
         guard !testingAll else { return }
-        guard !busy, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成"; return }
+        guard !busy, testingNodeIDs.isEmpty, selectingNodeID == nil else { notice = "请等待当前操作完成"; return }
         guard let subscription = config.subscriptions.first else { notice = "请先添加并更新订阅"; return }
         let temporaryCore = !core.isRunning && (!running || config.mode == .direct)
         if !core.isRunning {
@@ -346,7 +464,7 @@ final class AppModel: ObservableObject {
         defer { if temporaryCore { core.stopAndWait() } }
         testingAll = true
         let requestedIDs = ids.map(Set.init)
-        let targets = config.nodes.filter { $0.sourceID == subscription.id && $0.supported && (requestedIDs?.contains($0.id) ?? true) }
+        let targets = config.nodes.filter { $0.sourceID == subscription.id && $0.isSelectableProxy && (requestedIDs?.contains($0.id) ?? true) }
         guard !targets.isEmpty else { testingAll = false; notice = "没有可测速的节点"; return }
         do {
             let latencies = try await core.groupLatencies(target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
@@ -387,6 +505,9 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
+            // start() completes the unified activation and applies the system
+            // proxy. Returning here prevents a second backup/apply pass.
+            return
         }
         let services = Self.networkServices()
         guard !services.isEmpty else { notice = "没有找到可配置的网络服务"; return }
@@ -400,6 +521,10 @@ final class AppModel: ObservableObject {
         }
         var failures: [String] = []
         if enabled {
+            // Network services can disappear after a dock, VPN, or interface
+            // change. A backup for a service that no longer exists must not
+            // prevent the remaining active services from connecting.
+            config.systemProxyBackups.removeAll { !services.contains($0.service) }
             let hadBackups = !config.systemProxyBackups.isEmpty
             var activationAttempted = false
             // Preserve the original macOS proxy exactly once.  Reapplying after
@@ -460,19 +585,31 @@ final class AppModel: ObservableObject {
                 config.systemProxyBackups = []
             }
         } else {
-            let backups = Dictionary(config.systemProxyBackups.map { ($0.service, $0) }, uniquingKeysWith: { first, _ in first })
-            var unresolvedBackups = config.systemProxyBackups.filter { !services.contains($0.service) }
-            for (service, backup) in backups {
-                guard services.contains(service) else { continue }
-                let webRestored = Self.restoreProxy(service: service, endpoint: backup.web, secure: false)
-                let secureRestored = Self.restoreProxy(service: service, endpoint: backup.secureWeb, secure: true)
-                let socksRestored = backup.socks.map { Self.restoreSocksProxy(service: service, endpoint: $0) } ?? true
-                if !webRestored || !secureRestored || !socksRestored {
-                    failures.append(service)
-                    unresolvedBackups.append(backup)
+            if running || lastAppliedSystemProxyPort != nil {
+                // During a live disconnect, only restore entries that still
+                // point at Zhilian. Another proxy app may have taken ownership
+                // since activation and must not be overwritten.
+                let expectedPort = lastAppliedSystemProxyPort ?? systemProxyPort
+                let unresolved = relinquishSystemProxy(expectedPort: expectedPort)
+                failures.append(contentsOf: unresolved.map(\.service))
+                config.systemProxyBackups = unresolved
+            } else {
+                // Crash recovery has no live core/port ownership marker. Use
+                // the saved snapshot to restore every still-existing service.
+                let backups = Dictionary(config.systemProxyBackups.map { ($0.service, $0) }, uniquingKeysWith: { first, _ in first })
+                var unresolvedBackups = config.systemProxyBackups.filter { !services.contains($0.service) }
+                for (service, backup) in backups {
+                    guard services.contains(service) else { continue }
+                    let webRestored = Self.restoreProxy(service: service, endpoint: backup.web, secure: false)
+                    let secureRestored = Self.restoreProxy(service: service, endpoint: backup.secureWeb, secure: true)
+                    let socksRestored = backup.socks.map { Self.restoreSocksProxy(service: service, endpoint: $0) } ?? true
+                    if !webRestored || !secureRestored || !socksRestored {
+                        failures.append(service)
+                        unresolvedBackups.append(backup)
+                    }
                 }
+                config.systemProxyBackups = unresolvedBackups
             }
-            config.systemProxyBackups = unresolvedBackups
         }
         systemProxy = enabled && failures.isEmpty
         config.systemProxyEnabled = systemProxy
@@ -488,7 +625,7 @@ final class AppModel: ObservableObject {
 
     func changeMode(_ mode: ProxyMode) {
         guard config.mode != mode else { return }
-        guard !busy, !testingAll, testingNodeIDs.isEmpty else { notice = "请等待当前操作完成后再切换模式"; return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil, connectionTransition == nil else { notice = "请等待当前操作完成后再切换模式"; return }
         let previousMode = config.mode
         config.mode = mode
         save()
@@ -572,6 +709,36 @@ final class AppModel: ObservableObject {
             if !web.success || !secure.success || !socks.success || !verified || !socksVerified { failures.append(service) }
         }
         return failures
+    }
+
+    private static func anyServicePointsToLocalPort(_ expectedPort: Int) -> Bool {
+        func owned(_ endpoint: SystemProxyEndpoint?) -> Bool {
+            endpoint?.enabled == true && endpoint?.server == "127.0.0.1" && endpoint?.port == expectedPort
+        }
+        return networkServices().contains { service in
+            owned(proxyEndpoint(service: service, secure: false))
+                || owned(proxyEndpoint(service: service, secure: true))
+                || owned(socksProxyEndpoint(service: service))
+        }
+    }
+
+    /// Last-resort shutdown protection. This never installs another endpoint;
+    /// it only disables protocol entries that still point at this exact core.
+    private static func disableOwnedProxyEndpoints(expectedPort: Int) {
+        func owned(_ endpoint: SystemProxyEndpoint?) -> Bool {
+            endpoint?.enabled == true && endpoint?.server == "127.0.0.1" && endpoint?.port == expectedPort
+        }
+        for service in networkServices() {
+            if owned(proxyEndpoint(service: service, secure: false)) {
+                _ = run("/usr/sbin/networksetup", ["-setwebproxystate", service, "off"])
+            }
+            if owned(proxyEndpoint(service: service, secure: true)) {
+                _ = run("/usr/sbin/networksetup", ["-setsecurewebproxystate", service, "off"])
+            }
+            if owned(socksProxyEndpoint(service: service)) {
+                _ = run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", service, "off"])
+            }
+        }
     }
 
     private func updateNetworkPanel() async {
@@ -765,12 +932,18 @@ final class AppModel: ObservableObject {
     }
 
     private func failSafeAfterCoreFailure(_ message: String) {
-        let enableOnNextLaunch = config.systemProxyEnabled
+        let expectedPort = lastAppliedSystemProxyPort ?? (running ? systemProxyPort : nil)
         if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
-        config.systemProxyEnabled = enableOnNextLaunch
+        if let expectedPort, Self.anyServicePointsToLocalPort(expectedPort) {
+            Self.disableOwnedProxyEndpoints(expectedPort: expectedPort)
+        }
         server.stop()
         core.stopAndWait()
         running = false
+        systemProxy = false
+        config.proxyEnabled = false
+        config.systemProxyEnabled = false
+        connectionTransition = nil
         resetNetworkPanel()
         save()
         notice = message
@@ -779,12 +952,19 @@ final class AppModel: ObservableObject {
     /// AppKit calls this on Quit.  Unlike the visible Stop button, process
     /// cleanup must not silently change the user's "start on launch" choice.
     private func shutdownForTermination() {
-        let enableOnNextLaunch = config.systemProxyEnabled
+        let reconnectOnNextLaunch = config.autoConnectOnLaunch
+        let expectedPort = lastAppliedSystemProxyPort ?? (running ? systemProxyPort : nil)
         if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
-        config.systemProxyEnabled = enableOnNextLaunch
+        if let expectedPort, Self.anyServicePointsToLocalPort(expectedPort) {
+            Self.disableOwnedProxyEndpoints(expectedPort: expectedPort)
+        }
         server.stop()
         core.stopAndWait()
         running = false
+        systemProxy = false
+        config.proxyEnabled = reconnectOnNextLaunch
+        config.systemProxyEnabled = reconnectOnNextLaunch
+        connectionTransition = nil
         save()
     }
     private func providerCacheURL(_ subscriptionID: String) -> URL {

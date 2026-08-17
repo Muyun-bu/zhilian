@@ -30,6 +30,19 @@ struct NativeTests {
         let oldBackup = Data("{\"service\":\"Wi-Fi\",\"web\":{\"enabled\":false,\"server\":\"\",\"port\":0},\"secureWeb\":{\"enabled\":false,\"server\":\"\",\"port\":0}}".utf8)
         let decodedBackup = try JSONDecoder().decode(SystemProxyBackup.self, from: oldBackup)
         precondition(decodedBackup.socks == nil, "旧版代理备份兼容失败")
+        let oldConnectedConfig = Data("{\"proxyEnabled\":true,\"systemProxyEnabled\":true}".utf8)
+        let migratedConnectedConfig = try JSONDecoder().decode(PersistedConfig.self, from: oldConnectedConfig)
+        precondition(migratedConnectedConfig.autoConnectOnLaunch, "旧版完整连接状态没有迁移为自动连接")
+        let oldCoreOnlyConfig = Data("{\"proxyEnabled\":true,\"systemProxyEnabled\":false}".utf8)
+        let migratedCoreOnlyConfig = try JSONDecoder().decode(PersistedConfig.self, from: oldCoreOnlyConfig)
+        precondition(!migratedCoreOnlyConfig.autoConnectOnLaunch, "旧版核心单独运行状态不应迁移为完整连接")
+        let displayNode = ProxyNode(id: "display", name: "香港 03", type: "anytls", host: "example.com", port: 443,
+                                    method: nil, password: nil, username: nil, sourceID: "test", supported: true,
+                                    lastLatency: 47, lastError: nil)
+        precondition(displayNode.regionLabel == "香港" && displayNode.isSelectableProxy, "节点地区或可选状态计算失败")
+        var accountNode = displayNode
+        accountNode.name = "剩余流量：18 GB"
+        precondition(accountNode.regionLabel == "账户信息" && !accountNode.isSelectableProxy, "账户信息不应作为代理节点显示")
         if CommandLine.arguments.count > 1 {
             let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
             let nodes = SubscriptionService().parse(data: data, sourceID: "live")
@@ -47,6 +60,6 @@ struct NativeTests {
             guard working > 0 else { print("FAIL: 没有节点能完成真实代理请求"); exit(1) }
             print("PASS: \(working) 个节点完成 Shadowsocks 端到端代理请求")
         }
-        print("PASS: IP 数据库、国内/境外双层分流、订阅规范化和旧配置兼容")
+        print("PASS: IP 数据库、国内/境外双层分流、节点分类、订阅规范化和旧配置兼容")
     }
 }

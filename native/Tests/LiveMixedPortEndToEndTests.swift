@@ -12,7 +12,7 @@ struct LiveMixedPortEndToEndTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[1])
         let provider = URL(fileURLWithPath: CommandLine.arguments[2])
         let nodes = SubscriptionService().parse(data: try Data(contentsOf: provider), sourceID: "live")
-        guard let fallback = nodes.first(where: \.supported)?.name else {
+        guard let fallback = nodes.first(where: \.isSelectableProxy)?.name else {
             throw TunnelError.connect("测试订阅中没有可用节点")
         }
 
