@@ -23,7 +23,7 @@ cd native
 ./scripts/build_native.sh
 ```
 
-构建会生成以下文件到仓库上级目录的 `outputs/`：
+构建会在临时目录中组装应用，完成后自动清理 `.app` 暂存副本，并将以下文件写入仓库上级目录的 `outputs/`，避免开发构建被 macOS 启动台误认为另一份已安装应用：
 
 - `智连-0.6.2.dmg`
 - `智连-0.6.2-macOS.zip`
