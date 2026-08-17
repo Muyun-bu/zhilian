@@ -648,6 +648,7 @@ struct ConnectionsView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var confirmingUninstall = false
 
     var body: some View {
         Form {
@@ -682,12 +683,31 @@ struct SettingsView: View {
                 Label("订阅令牌只保存在本机应用数据目录", systemImage: "lock.shield")
                 Label("代理仅监听 127.0.0.1，不接受局域网连接", systemImage: "laptopcomputer.and.iphone")
             }
+            Section("维护") {
+                Button(role: .destructive) {
+                    confirmingUninstall = true
+                } label: {
+                    Label(model.uninstalling ? "正在卸载…" : "彻底卸载智连…", systemImage: "trash")
+                }
+                .disabled(model.uninstalling || model.busy || model.testingAll || !model.testingNodeIDs.isEmpty || model.selectingNodeID != nil)
+                Text("彻底卸载会先恢复系统网络设置，再删除订阅、节点、缓存和日志，将应用移入废纸篓，并清除启动台记录。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section {
-                Text("智连 0.6.2 · 原生 macOS 应用")
+                Text("智连 0.6.3 · 原生 macOS 应用")
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .padding()
+        .confirmationDialog("彻底卸载智连？", isPresented: $confirmingUninstall, titleVisibility: .visible) {
+            Button("恢复网络并彻底卸载", role: .destructive) {
+                model.uninstallApplication()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("订阅、节点、设置、缓存和日志将永久删除且无法恢复；智连应用会被移入废纸篓。")
+        }
     }
 }

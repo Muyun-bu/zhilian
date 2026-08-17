@@ -46,6 +46,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var testingNodeIDs: Set<String> = []
     @Published private(set) var selectingNodeID: String?
     @Published private(set) var connectionTransition: ConnectionTransition?
+    @Published private(set) var uninstalling = false
     let store = ConfigStore()
     private let server: ProxyServer
     private let subscriptionService = SubscriptionService()
@@ -272,6 +273,37 @@ final class AppModel: ObservableObject {
     func setAutoConnectOnLaunch(_ enabled: Bool) {
         config.autoConnectOnLaunch = enabled
         save()
+    }
+
+    /// Finder only moves an app bundle to Trash; it cannot safely restore the
+    /// proxy or remove the app's private data. This explicit flow does both,
+    /// then removes only Zhilian's Launchpad entry and exits without saving a
+    /// fresh config file during the termination notification.
+    func uninstallApplication() {
+        guard !uninstalling else { return }
+        guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else {
+            notice = "请等待当前操作完成后再卸载智连"
+            return
+        }
+        guard stop() else { return }
+        uninstalling = true
+        timer?.invalidate()
+        do {
+            let result = try UninstallService.perform(runningApplicationURL: Bundle.main.bundleURL)
+            if !result.cleanupFailures.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "智连已移入废纸篓"
+                alert.informativeText = "以下数据未能删除：\n" + result.cleanupFailures.joined(separator: "\n")
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+            }
+            NSApplication.shared.terminate(nil)
+        } catch {
+            uninstalling = false
+            connectionTransition = nil
+            notice = error.localizedDescription
+        }
     }
 
     private func completeConnectionActivation() {
@@ -939,6 +971,12 @@ final class AppModel: ObservableObject {
     /// AppKit calls this on Quit.  Unlike the visible Stop button, process
     /// cleanup must not silently change the user's "start on launch" choice.
     private func shutdownForTermination() {
+        if uninstalling {
+            timer?.invalidate()
+            server.stop()
+            core.stopAndWait()
+            return
+        }
         let reconnectOnNextLaunch = config.autoConnectOnLaunch
         let expectedPort = lastAppliedSystemProxyPort ?? (running ? systemProxyPort : nil)
         if systemProxy || !config.systemProxyBackups.isEmpty { setSystemProxy(false) }
