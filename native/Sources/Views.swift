@@ -297,7 +297,7 @@ struct NodesView: View {
             HStack(spacing: 18) {
                 Header(
                     title: "代理节点",
-                    subtitle: "真实 HTTP 延迟 · \(model.config.latencyTestTarget.title) · \(model.config.latencyTimeoutMilliseconds / 1_000) 秒超时"
+                    subtitle: "节点 TCP 延迟 · 3 次取中位数 · \(model.config.latencyTimeoutMilliseconds / 1_000) 秒超时"
                 )
                 Button {
                     let ids = availableNodes.map(\.id)
@@ -667,18 +667,14 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Section("真实测速") {
-                Picker("测试目标", selection: $model.config.latencyTestTarget) {
-                    ForEach(LatencyTestTarget.allCases) { Text($0.title).tag($0) }
-                }
-                .onChange(of: model.config.latencyTestTarget) { _ in model.save() }
+            Section("节点延迟") {
                 Picker("超时时间", selection: $model.config.latencyTimeoutMilliseconds) {
+                    Text("2 秒").tag(2_000)
+                    Text("3 秒").tag(3_000)
                     Text("5 秒").tag(5_000)
-                    Text("8 秒").tag(8_000)
-                    Text("12 秒").tag(12_000)
                 }
                 .onChange(of: model.config.latencyTimeoutMilliseconds) { _ in model.save() }
-                Text("测速会让 Mihomo 通过节点访问所选 HTTP 目标；不同软件必须使用相同目标和超时设置才可横向比较。")
+                Text("测速仅计算本机连接到节点服务器地址和端口的 TCP 延迟，每个节点测试 3 次并取中位数，不会访问第三方测试网站。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -687,7 +683,7 @@ struct SettingsView: View {
                 Label("代理仅监听 127.0.0.1，不接受局域网连接", systemImage: "laptopcomputer.and.iphone")
             }
             Section {
-                Text("智连 0.6.1 · 原生 macOS 应用")
+                Text("智连 0.6.2 · 原生 macOS 应用")
                     .foregroundStyle(.secondary)
             }
         }

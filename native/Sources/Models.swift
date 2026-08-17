@@ -64,7 +64,7 @@ enum RuleKind: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-struct ProxyNode: Codable, Identifiable, Hashable {
+struct ProxyNode: Codable, Identifiable, Hashable, Sendable {
     var id: String
     var name: String
     var type: String
@@ -187,7 +187,7 @@ struct PersistedConfig: Codable {
     var subscriptions: [SubscriptionProfile] = []
     var customRules: [RoutingRule] = []
     var latencyTestTarget: LatencyTestTarget = .google204
-    var latencyTimeoutMilliseconds = 8_000
+    var latencyTimeoutMilliseconds = 3_000
     var systemProxyEnabled = false
     var systemProxyBackups: [SystemProxyBackup] = []
     var autoConnectOnLaunch = false
@@ -206,7 +206,8 @@ struct PersistedConfig: Codable {
         subscriptions = try values.decodeIfPresent([SubscriptionProfile].self, forKey: .subscriptions) ?? []
         customRules = try values.decodeIfPresent([RoutingRule].self, forKey: .customRules) ?? []
         latencyTestTarget = try values.decodeIfPresent(LatencyTestTarget.self, forKey: .latencyTestTarget) ?? .google204
-        latencyTimeoutMilliseconds = try values.decodeIfPresent(Int.self, forKey: .latencyTimeoutMilliseconds) ?? 8_000
+        let savedLatencyTimeout = try values.decodeIfPresent(Int.self, forKey: .latencyTimeoutMilliseconds) ?? 3_000
+        latencyTimeoutMilliseconds = min(5_000, max(2_000, savedLatencyTimeout))
         systemProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .systemProxyEnabled) ?? false
         systemProxyBackups = try values.decodeIfPresent([SystemProxyBackup].self, forKey: .systemProxyBackups) ?? []
         autoConnectOnLaunch = try values.decodeIfPresent(Bool.self, forKey: .autoConnectOnLaunch)

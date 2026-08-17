@@ -24,6 +24,12 @@ private final class TrafficAccumulator: @unchecked Sendable {
     }
 }
 
+private struct NodeProbeResult: Sendable {
+    var id: String
+    var latency: Int?
+    var error: String?
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var config: PersistedConfig
@@ -400,31 +406,17 @@ final class AppModel: ObservableObject {
         guard !busy, !testingAll, testingNodeIDs.isEmpty, selectingNodeID == nil else { return }
         guard let node = config.nodes.first(where: { $0.id == id }) else { return }
         guard node.isSelectableProxy else { return }
-        guard let subscription = config.subscriptions.first, subscription.id == node.sourceID else {
-            notice = "该节点不属于当前活动订阅"
-            return
-        }
         testingNodeIDs.insert(id)
         defer { testingNodeIDs.remove(id) }
-        let temporaryCore = !core.isRunning && (!running || config.mode == .direct)
-        if !core.isRunning {
-            do {
-                try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: .rule)
-                if running && config.mode != .direct && systemProxy, !refreshSystemProxyEndpoint() {
-                    failSafeAfterCoreFailure("节点测速启动核心后，系统代理端口更新失败")
-                    return
-                }
-            }
-            catch { notice = error.localizedDescription; return }
-        }
-        defer { if temporaryCore { core.stopAndWait() } }
-        var latency: Int?; var failure: String?
-        do {
-            guard core.isRunning else { throw TunnelError.connect("代理核心已停止，无法执行真实测速") }
-            latency = try await core.latency(node: node.name, target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
-        } catch { failure = error.localizedDescription }
+        let host = node.host
+        let port = node.port
+        let timeout = max(1, config.latencyTimeoutMilliseconds / 1_000)
+        let measurement = await Task.detached(priority: .utility) {
+            NodeLatencyProbe.measure(host: host, port: port, attempts: 3, timeoutSeconds: timeout)
+        }.value
         guard let index = config.nodes.firstIndex(where: { $0.id == id }) else { return }
-        config.nodes[index].lastLatency = latency; config.nodes[index].lastError = failure
+        config.nodes[index].lastLatency = measurement.milliseconds
+        config.nodes[index].lastError = measurement.error
         save()
     }
 
@@ -450,41 +442,36 @@ final class AppModel: ObservableObject {
         guard !testingAll else { return }
         guard !busy, testingNodeIDs.isEmpty, selectingNodeID == nil else { notice = "请等待当前操作完成"; return }
         guard let subscription = config.subscriptions.first else { notice = "请先添加并更新订阅"; return }
-        let temporaryCore = !core.isRunning && (!running || config.mode == .direct)
-        if !core.isRunning {
-            do {
-                try core.start(providerFile: providerCacheURL(subscription.id), selectedNode: selectedNode?.name, mode: .rule)
-                if running && config.mode != .direct && systemProxy, !refreshSystemProxyEndpoint() {
-                    failSafeAfterCoreFailure("一键测速启动核心后，系统代理端口更新失败")
-                    return
-                }
-            }
-            catch { notice = error.localizedDescription; return }
-        }
-        defer { if temporaryCore { core.stopAndWait() } }
         testingAll = true
+        defer { testingAll = false }
         let requestedIDs = ids.map(Set.init)
         let targets = config.nodes.filter { $0.sourceID == subscription.id && $0.isSelectableProxy && (requestedIDs?.contains($0.id) ?? true) }
-        guard !targets.isEmpty else { testingAll = false; notice = "没有可测速的节点"; return }
-        do {
-            let latencies = try await core.groupLatencies(target: config.latencyTestTarget, timeoutMilliseconds: config.latencyTimeoutMilliseconds)
-            for node in targets {
-                guard let index = config.nodes.firstIndex(where: { $0.id == node.id }) else { continue }
-                config.nodes[index].lastLatency = latencies[node.name]
-                config.nodes[index].lastError = latencies[node.name] == nil ? "测速超时或节点不可用" : nil
-            }
-        } catch {
-            for node in targets {
-                if let index = config.nodes.firstIndex(where: { $0.id == node.id }) {
-                    config.nodes[index].lastLatency = nil
-                    config.nodes[index].lastError = error.localizedDescription
+        guard !targets.isEmpty else { notice = "没有可测速的节点"; return }
+        let timeout = max(1, config.latencyTimeoutMilliseconds / 1_000)
+        let probeTargets = targets.map { (id: $0.id, host: $0.host, port: $0.port) }
+        for batchStart in stride(from: 0, to: probeTargets.count, by: 4) {
+            let batchEnd = min(batchStart + 4, probeTargets.count)
+            let batch = Array(probeTargets[batchStart..<batchEnd])
+            let results = await withTaskGroup(of: NodeProbeResult.self, returning: [NodeProbeResult].self) { group in
+                for target in batch {
+                    group.addTask {
+                        let measurement = NodeLatencyProbe.measure(host: target.host, port: target.port, attempts: 3, timeoutSeconds: timeout)
+                        return .init(id: target.id, latency: measurement.milliseconds, error: measurement.error)
+                    }
                 }
+                var values: [NodeProbeResult] = []
+                for await result in group { values.append(result) }
+                return values
             }
+            for result in results {
+                guard let index = config.nodes.firstIndex(where: { $0.id == result.id }) else { continue }
+                config.nodes[index].lastLatency = result.latency
+                config.nodes[index].lastError = result.error
+            }
+            save()
         }
-        save()
-        testingAll = false
         let available = targets.filter { node in config.nodes.first(where: { $0.id == node.id })?.lastLatency != nil }.count
-        notice = "测速完成：\(available)/\(targets.count) 个节点可用"
+        notice = "节点延迟测试完成：\(available)/\(targets.count) 个服务器可连接"
     }
 
     func setSystemProxy(_ enabled: Bool) {

@@ -31,10 +31,27 @@ final class SocketFD: @unchecked Sendable {
         while let info = pointer?.pointee {
             let socketFD = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
             if socketFD >= 0 {
-                var tv = timeval(tv_sec: timeout, tv_usec: 0)
-                setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
-                setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
-                if Darwin.connect(socketFD, info.ai_addr, info.ai_addrlen) == 0 { return SocketFD(fd: socketFD) }
+                let timeoutSeconds = max(1, timeout)
+                let originalFlags = fcntl(socketFD, F_GETFL, 0)
+                if originalFlags >= 0 { _ = fcntl(socketFD, F_SETFL, originalFlags | O_NONBLOCK) }
+                var connected = Darwin.connect(socketFD, info.ai_addr, info.ai_addrlen) == 0
+                if !connected, errno == EINPROGRESS {
+                    var descriptor = pollfd(fd: socketFD, events: Int16(POLLOUT), revents: 0)
+                    let pollResult = Darwin.poll(&descriptor, 1, Int32(timeoutSeconds * 1_000))
+                    if pollResult > 0 {
+                        var socketError: Int32 = 0
+                        var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
+                        connected = getsockopt(socketFD, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) == 0
+                            && socketError == 0
+                    }
+                }
+                if connected {
+                    if originalFlags >= 0 { _ = fcntl(socketFD, F_SETFL, originalFlags) }
+                    var tv = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+                    setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+                    setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+                    return SocketFD(fd: socketFD)
+                }
                 Darwin.close(socketFD)
             }
             pointer = info.ai_next
